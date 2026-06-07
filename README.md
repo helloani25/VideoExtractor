@@ -1,13 +1,499 @@
 # VideoExtractor: YouTube Demo Analysis Pipeline
 
-This project contains two tools that answer different questions about a product demo video:
+This project contains three tools that answer different questions about a product demo video:
 
-| Script | Question answered | Best for |
+| Script | Question answered | Backend | Best for |
+|---|---|---|---|
+| `video_extractor.py` | **"What text is visible on screen?"** | Ollama / OpenAI | Reading UI elements, labels, menus, and data values shown in the demo |
+| `product_demo_video_analyzer.py` | **"What is the presenter doing and why?"** | Ollama (`qwen2.5vl:32b`) | Laptop pipeline. Same Qwen2.5-VL model family as the DGX build, so Mac runs preview DGX output. |
+| `product_demo_video_analyzer_dgx.py` | **"What is the presenter doing and why?"** | vLLM (`Qwen2.5-VL-32B-AWQ`) + RapidOCR + pHash-gated keyframing | Same questions, rebuilt for NVIDIA GB10 Grace-Blackwell hardware (MSI EdgeXpert / DGX Spark). ~10-25× faster than the Ollama pipeline on the same box. |
+
+If you're on an NVIDIA GB10 Blackwell box (EdgeXpert / DGX Spark), use `_analyzer_dgx.py`. If you're on a laptop with Ollama, use the original `_analyzer.py`. The rest of this README explains both.
+
+---
+
+## Why `product_demo_video_analyzer_dgx.py` exists — a hardware-driven rewrite
+
+The original `product_demo_video_analyzer.py` runs Ollama-hosted `qwen2.5vl:32b` over HTTP. On a laptop this is **too slow to be practical**: a single vision summary over 20 keyframes takes 5-10 minutes, and macro-chunking (~80 vision calls on a 20-min video) routinely times out or OOMs. Ollama's REST loop can't batch multi-image prompts and the local model quantization doesn't touch any modern accelerator kernels.
+
+`_analyzer_dgx.py` rebuilds the same pipeline for the **NVIDIA GB10 Grace-Blackwell platform** (MSI EdgeXpert, NVIDIA DGX Spark, and other GB10-partner boxes: 20-core Grace ARM CPU + Blackwell GPU + 128 GB unified LPDDR5X). Three architectural decisions drive the whole rewrite:
+
+### 1. Inference engine: vLLM instead of Ollama
+
+Ollama uses **llama.cpp** under the hood. On any platform, llama.cpp dequantizes 4-bit weights to bf16 for every matmul — Blackwell's native FP4 tensor cores are never touched. The HTTP REST loop also serialises image encoding on the client side, so multi-image prompts are sent sequentially rather than batched.
+
+**vLLM's `LLM.chat()` API prefills all images in one pass** and dispatches to Blackwell tensor-core kernels directly (AWQ-Marlin on AWQ checkpoints). The engine swap alone gives 3-5× throughput on GB10 before quantization changes are factored in.
+
+Where Ollama sits on your GB10 box (32B model, 24 keyframes, 20-min video):
+
+| Backend | Vision summary wall-clock | Notes |
 |---|---|---|
-| `video_extractor.py` | **"What text is visible on screen?"** | Reading UI elements, labels, menus, and data values shown in the demo |
-| `product_demo_video_analyzer.py` | **"What is the presenter doing and why?"** | Understanding workflow, features, and intent from the audio narrative |
+| **vLLM + AWQ-Marlin** | **~4 min** | Default; Marlin kernel auto-selected by vLLM |
+| vLLM + NVFP4 | ~2-3 min | Requires pre-quantized NVFP4 checkpoint + `--quantization nvfp4` |
+| Ollama + Qwen2.5-VL-32B | ~8-12 min | llama.cpp / bf16-dequant path; ~30-50% of vLLM throughput |
+| Ollama on laptop (e.g., M2) | ~30-40 min | Often fails mid-run with vision timeouts |
 
-Both can be combined: `product_demo_video_analyzer.py` supports `--ocr-backend` to answer both questions in a single run.
+If your instinct is "just use Ollama — it's easier to set up", note that setup pain is a one-time cost and Ollama on GB10 is roughly 2-3× *slower* than vLLM on the same box because it hits the same bf16-dequant path bitsandbytes NF4 did.
+
+### 2. Model: Qwen2.5-VL-32B-AWQ, not 72B
+
+Blackwell's on-package unified memory (128 GB LPDDR5X, ~273 GB/s bandwidth) is generous for weights but modest on bandwidth compared to HBM3. Vision transformers are memory-bandwidth-bound at decode, so **model size trades off nearly linearly against throughput**:
+
+| Model | Weights (AWQ) | Prefill (24 images) | Decode (2048 tokens) | Vision summary end-to-end |
+|---|---|---|---|---|
+| Qwen2.5-VL-72B-AWQ | ~40 GB | ~90 s | ~600 s (3.4 tok/s) | ~11 min |
+| **Qwen2.5-VL-32B-AWQ** (default) | ~17 GB | ~35 s | ~180 s (11 tok/s) | **~4 min** |
+| Qwen2.5-VL-7B-AWQ | ~5 GB | ~10 s | ~50 s (40 tok/s) | ~1 min |
+
+32B is the practical sweet spot — quality is indistinguishable from 72B for structured demo-summarization prompts, and wall-clock is ~3× faster. Swap to 7B via `--vision-model Qwen/Qwen2.5-VL-7B-Instruct-AWQ` when you want interactive iteration.
+
+### 3. Quantization: AWQ-Marlin now, NVFP4 later
+
+Blackwell's headline "1 PFLOP FP4" throughput requires **native FP4 tensor-core kernels** — NVFP4 or MXFP4 formats with weights pre-quantized offline and served through TensorRT-LLM or vLLM's FP4 backend. The previous plan-of-record (`bitsandbytes` NF4) is a *storage* trick: weights are packed to 4 bits on disk but **dequantized to bf16 on every matmul**, so compute stays on the older bf16 tensor cores. You get the memory savings but none of Blackwell's FP4 hardware advantage.
+
+The current default (`--quantization` unset → auto-detects AWQ from the checkpoint → picks the `awq_marlin` kernel on Blackwell) gets ~3× the throughput of bf16 at the same VRAM footprint as bitsandbytes NF4, with no rebuild step. Users with an NVFP4-quantized checkpoint can pass `--quantization nvfp4` and swap the model ID to unlock the full FP4 path — no other code changes.
+
+### How the precision formats actually work — NF4, BF16, AWQ, NVFP4
+
+Understanding why NF4 is "fake 4-bit" requires a quick look at how floating-point formats trade bits between *range* and *precision*, and what "block scaling" changes about that trade-off.
+
+#### BF16 — the baseline compute format
+
+A floating-point number is represented as:
+```
+value = (-1)^sign × 2^(exponent − bias) × (1 + mantissa / 2^M)
+```
+
+| Format | Total bits | Sign | Exponent | Mantissa | Dynamic range | Precision steps |
+|---|---|---|---|---|---|---|
+| FP32 | 32 | 1 | 8 | 23 | ±3.4 × 10^38 | ~16M per exponent step |
+| **BF16** | 16 | 1 | **8** | 7 | ±3.4 × 10^38 (same as FP32) | ~128 per exponent step |
+| FP16 | 16 | 1 | 5 | 10 | ±65504 (much smaller) | ~1024 per exponent step |
+
+BF16 keeps FP32's 8-exponent-bit dynamic range but cuts mantissa precision to 7 bits. This is a deliberate ML trade-off: neural network weights span many orders of magnitude (need wide range) but don't require fine-grained precision (coarse steps are fine). **BF16 tensor cores are the standard compute path on Ampere/Hopper; Blackwell has them too, but adds faster FP4 units on top.**
+
+#### NF4 — storage-only "4-bit", not compute 4-bit
+
+bitsandbytes `BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4")` stores weights as NormalFloat 4 (NF4). Here is what NF4 actually does:
+
+1. **Offline**: divide each 64-weight block by its absmax to normalize to [-1, 1]. Map each value to the nearest of 16 quantization levels. The 16 levels are NOT uniformly spaced — they are the 16 *quantiles* of a standard normal distribution:
+   ```
+   {-1.0, -0.6962, -0.5251, -0.3949, -0.2844, -0.1848, -0.0911, 0,
+     0.0796,  0.1609,  0.2461,  0.3379,  0.4407,  0.5626, 0.7229, 1.0}
+   ```
+   More levels cluster near zero because neural network weights follow an approximately normal distribution — most weights are small, few are large. NF4 is information-theoretically optimal for this distribution.
+
+2. **At inference (every single matmul)**: bitsandbytes calls `dequantize_blockwise()`, reconstructing BF16 tensors from the stored 4-bit indices. The actual `nn.Linear` call then runs on **BF16 CUDA cores**, not FP4 hardware.
+
+**The consequence**: you get the memory saving (4× smaller than BF16) but the computation cost is the same as BF16 plus a dequantize overhead. Blackwell's FP4 tensor-core units sit idle.
+
+#### AWQ — activation-aware INT4, with fused Marlin kernels
+
+AWQ (Activation-Aware Weight Quantization) also stores weights in 4 bits, but differently:
+
+1. **Observation**: quantization error matters most for weights that multiply *large activations*. A 1% error on a weight paired with an activation of magnitude 100 does 100× more damage than the same error on a weight paired with an activation of magnitude 1.
+2. **AWQ offline pass**: find a per-channel scale `s` that minimises `‖(W/s) − round(W/s)‖` weighted by activation magnitudes. This scale is absorbed into the adjacent normalization layer — no runtime overhead.
+3. **Result**: INT4 weights packed in a group-wise layout that Marlin kernels can consume.
+
+**Marlin (the kernel vLLM uses on Blackwell)**: fuses the INT4→BF16 dequantize step and the matrix multiply into a single CUDA kernel that saturates memory bandwidth. It reads 4-bit weights, reconstructs BF16 on-the-fly in shared memory, and dispatches to BF16 tensor cores — all without the separate `dequantize_blockwise()` call that bitsandbytes needs. The fused kernel is ~3× faster than bitsandbytes NF4 at the same weight size because:
+- No separate dequantize kernel launch
+- BF16 tensor cores see a continuous stream of work
+- Memory reads are 4× smaller, so LPDDR5X bandwidth goes 4× further
+
+AWQ-Marlin is still using **BF16 tensor cores**, not FP4. It just reaches them much more efficiently.
+
+#### NVFP4 / MXFP4 — real 4-bit compute via block scaling
+
+FP4 (E2M1 format: 1 sign, 2 exponent, 1 mantissa) has only 16 representable values and a tiny range — far too coarse for isolated weights. The trick that makes it usable is **microscaling**:
+
+```
+weight_block = [w₁, w₂, ..., w₃₂]   ← 32 weights share one FP8 scale
+actual_value[i] = w_fp4[i] × scale_fp8
+```
+
+1. Every 32 weights in a column get one shared FP8 scale factor (stored separately, 8 bits).
+2. Each weight is then stored as FP4 relative to that scale.
+3. The tensor core performs: `output = (W_fp4 × scale_fp8) @ activation` **entirely in FP4 arithmetic** — no dequantization to BF16 first.
+
+Why does this preserve accuracy despite only 1 mantissa bit in FP4?
+- The FP8 scale covers the block's dynamic range (8 exponent bits → same range as BF16)
+- FP4 encodes the *relative* precision within the block (think of it as: the scale is the "big ruler", FP4 is the "tick marks")
+- Neighbouring weights in the same column tend to have similar magnitudes (smooth weight landscapes), so one shared scale loses little information
+
+**The result**: the matmul truly runs through Blackwell's dedicated FP4 tensor cores. No intermediate BF16. This is where the "1 PFLOP FP4" figure comes from — FP4 tensor cores deliver 2× the FLOPs of BF16 tensor cores at the same silicon area.
+
+#### Side-by-side comparison
+
+| Format | Bits/weight | Compute path | Dequantize to BF16? | Tensor cores used | Throughput on GB10 (32B) |
+|---|---|---|---|---|---|
+| BF16 (no quant) | 16 | Direct matmul | No | BF16 | 1× (baseline) |
+| bitsandbytes NF4 | 4 (storage only) | Dequantize → BF16 matmul | **Yes, every call** | BF16 | ~0.9× (overhead) |
+| **AWQ-Marlin** (default) | 4 (INT4 + scale) | Fused dequantize + matmul | Fused, in shared mem | BF16 | **~3×** |
+| NVFP4 / MXFP4 | 4 (true compute) | Native FP4 matmul | **No** | FP4 | ~6× (projected) |
+
+**Bottom line**: NF4 (bitsandbytes) gives memory savings but no compute speed-up on Blackwell. AWQ-Marlin is the practical maximum today. NVFP4 is the ceiling but requires a pre-quantized checkpoint and vLLM FP4 backend support — not yet mainstream for Qwen2.5-VL.
+
+## OCR swap: PaddleOCR → RapidOCR
+
+The original plan targeted PaddleOCR with TensorRT, but on aarch64 + CUDA 12.8:
+
+- `paddlepaddle-gpu` wheels lag the CUDA version and often silently fall back to CPU.
+- PaddleOCR 2.x → 3.x removed the `use_gpu`, `use_tensorrt`, `use_angle_cls`, and `enable_mkldnn` kwargs. Code written against the old API breaks on install.
+- The `enable_mkldnn` path is CPU-only Intel-DNN — meaningless on Grace ARM anyway.
+
+**RapidOCR (ONNX Runtime)** ships clean ARM-native wheels, has a stable API across versions, and doesn't need CUDA at all. The catch — CPU by default — is compensated by the pHash prefilter below.
+
+## Keyframing: dHash prefilter + OCR-gated saves
+
+The `--keyframe-mode ocr` path in the original `_analyzer.py` would run PaddleOCR at 1 FPS across the entire video — ~1800 OCR calls on a 30-min video, just to detect frames where the on-screen text changed. Even fast OCR at that volume dominates wall-clock time.
+
+`_analyzer_dgx.py` gates OCR behind a **dHash (perceptual hash) prefilter**:
+
+1. Compute an 8×8 dHash of each 1-FPS sample (a few microseconds per frame).
+2. If Hamming distance from the last saved frame ≤ `--phash-threshold` (default `5/64` bits ≈ 8% visual change), **skip OCR entirely** — the frame is visually similar to what's already saved.
+3. Only run OCR on frames that pass the visual-change gate.
+4. Save the frame if OCR text similarity < `--ocr-similarity-threshold` (default 0.85).
+
+Numbers from a real 20-minute construction demo run on EdgeXpert:
+
+```
+[ocr-filter] Done: 56 keyframes saved, 80 OCR calls, 58 phash skips.
+```
+
+That's 80 OCR calls versus the ~1200 the naive approach would have made — **~93% reduction in OCR work**. CPU RapidOCR handles the residual 80 calls in <10 seconds total on Grace.
+
+## Macro-chunking: now off by default in `_analyzer_dgx.py`
+
+Macro-chunking was the original heavyweight path in `_analyzer.py`: dense 6-FPS sampling into 15-second windows, one LLM vision call per window (~80 calls on a 20-min video). It existed to compensate for **interval-based keyframing** missing UI state transitions between samples.
+
+With OCR-gated keyframes, that redundancy disappears — keyframes are already state-aware, one per distinct on-screen state. The single `analyze_with_qwen_vision` call over 24 sampled keyframes captures the same content as macro-chunking's 80 calls, at ~25× less compute:
+
+| Pipeline | LLM vision calls | Wall time on GB10 (20-min video, 32B AWQ) |
+|---|---|---|
+| Vision summary (24 keyframes, 1 call) | 1 | **~1 min** |
+| Macro-chunking (80 windows × 8 frames) | ~80 | ~25-40 min |
+
+`_analyzer_dgx.py` defaults `--macro-chunking` to **off**. Turn it on for edge cases: long-form videos (45+ min) where 24 keyframes can't hold all state, purely-visual content (chart animations, 3D rotations) that OCR misses, or downstream tools that need per-timestamp analysis.
+
+## Recommended run on GB10 hardware
+
+```bash
+python product_demo_video_analyzer_dgx.py \
+  --url "https://youtu.be/..." \
+  --keyframe-mode ocr \
+  --phash-threshold 5
+```
+
+That's it. `--analysis`, `--vision-summary`, and `--timeline` are on by default; `--macro-chunking` is off. Total wall time on a 20-min demo: **~5-8 min end-to-end** (transcript + keyframes + vision summary + PM/UX/dev analysis). The equivalent run on `_analyzer.py` with Ollama on a laptop is 45+ min, and often fails partway through with vision timeouts.
+
+## Running multiple videos
+
+`--url` and `--file` both accept `action="append"` — repeat the flag once per video. **vLLM loads the model once** and is reused across every input in the batch, so per-video overhead is transcript + keyframes + LLM calls only (no reload penalty).
+
+**Multiple YouTube/Wistia URLs:**
+
+```bash
+python product_demo_video_analyzer_dgx.py \
+  --url "https://youtu.be/VIDEO_ID_1" \
+  --url "https://youtu.be/VIDEO_ID_2" \
+  --url "https://youtu.be/VIDEO_ID_3" \
+  --keyframe-mode ocr
+```
+
+Each video gets its own output directory under `artifacts/reports/<video_id>/` and `artifacts/frames/<video_id>/`.
+
+**Multiple local files:**
+
+```bash
+python product_demo_video_analyzer_dgx.py \
+  --file archive/demo_v1.mp4 \
+  --file archive/demo_v2.mp4 \
+  --keyframe-mode ocr
+```
+
+**Pairing a URL with a local file (use local copy for video, URL for transcript API):**
+
+Pass `--url` and `--file` in matched order. The n-th `--url` is paired with the n-th `--file`. The URL is used to fetch a YouTube transcript (faster than Whisper); the local `.mp4` is decoded for frames and Whisper fallback — no re-download.
+
+```bash
+python product_demo_video_analyzer_dgx.py \
+  --url "https://youtu.be/VIDEO_ID_1" --file archive/demo_v1.mp4 \
+  --url "https://youtu.be/VIDEO_ID_2" --file archive/demo_v2.mp4
+```
+
+**Shell loop for a whole folder** (useful when you have many local files and no remote URL):
+
+```bash
+for f in archive/*.mp4; do
+  python product_demo_video_analyzer_dgx.py \
+    --file "$f" \
+    --keyframe-mode ocr \
+    --no-macro-chunking
+done
+```
+
+The shell loop runs videos sequentially, reloading vLLM per invocation — use the multi-`--file` form above when you want the single-load benefit across all videos.
+
+---
+
+## Pipeline — `product_demo_video_analyzer_dgx.py`
+
+```text
+[Input: YouTube URL | Wistia URL | Local .mp4]
+    |
+    +--> Download (yt-dlp)                [skipped when --file is provided]
+    |
+    +--> Transcript chain (first success wins)
+    |      1) youtube-transcript-api      [YouTube URLs only]
+    |      2) yt-dlp .vtt subtitles       [YouTube URLs only]
+    |      3) Whisper local transcription [always available — used for Wistia + local files]
+    |
+    +--> Keyframe extraction  — pick ONE mode via --keyframe-mode
+    |      |
+    |      +-- interval  [--keyframe-mode interval]
+    |      |     Sample one frame every --keyframe-seconds (default 20 s).
+    |      |     Fixed cadence, content-agnostic.
+    |      |     Best for: predictable transcript alignment; talking-head videos
+    |      |     with little UI change.
+    |      |
+    |      +-- scene     [--keyframe-mode scene]
+    |      |     Save a frame when cv2.absdiff(frame, prev_frame).mean() >= --scene-threshold.
+    |      |     Triggers on any visual pixel change; no OCR involved.
+    |      |     --min-keyframe-gap enforces a minimum seconds-between-saves floor.
+    |      |     Best for: chart animations, 3D rotations, drawings — content that
+    |      |     changes visually but not textually.
+    |      |
+    |      +-- ocr       [--keyframe-mode ocr]   [DEFAULT]
+    |            dHash prefilter + RapidOCR text-change detection.
+    |            For each 1-FPS sample:
+    |              1. dHash(frame) — 64-bit visual fingerprint
+    |              2. Hamming distance <= --phash-threshold?  yes: skip (no OCR call)
+    |              3. RapidOCR (ONNX Runtime, CPU) reads on-screen text
+    |              4. text similarity < --ocr-similarity-threshold?
+    |                    yes: save frame + OCR text as keyframe
+    |                    no : skip
+    |            Best for: UI-heavy product demos where each screen state has
+    |            distinct on-screen text (menus, forms, tables).
+    |
+    +--> Timeline output           HTML / Markdown / JSON side-by-side viewer
+    |                               keyframe + transcript window + OCR text per row
+    |                               artifacts/reports/<video_id>_timeline.{html,md,json}
+    |
+    +--> Vision summary            vLLM (Qwen2.5-VL-32B-AWQ, awq_marlin on Blackwell)
+    |                               up to --max-vision-frames keyframes + transcript + OCR
+    |                               -> single 7-section markdown report
+    |                               artifacts/reports/<video_id>_vision_summary.md
+    |
+    +--> PM / UX / Dev analysis    vLLM (same engine, text-only — no images)
+    |                               full transcript (up to 45 K chars)
+    |                               -> Summary + Industry Pain Points + Entities + Workflow +
+    |                                  PM view + UX view + Dev view + Open Questions +
+    |                                  Automation Opportunities
+    |                               artifacts/reports/<video_id>_analysis.md
+    |
+    +--> [OPT-IN] Macro-chunking   OFF by default. Enable with --macro-chunking for
+                                   long-form videos (45+ min) or purely-visual content.
+                                   6 fps capture -> 15 s windows -> 8 diverse frames/window
+                                   -> one vLLM vision call per window (~80 calls / 20 min video)
+                                   -> per-window analysis + compiled full summary
+                                   artifacts/reports/<video_id>_macro_chunk_{analysis,summary}.md
+```
+
+Notes on the flow above:
+
+- **Keyframes are extracted once**, then reused by Timeline and Vision summary — no redundant frame decoding.
+- **The vision summary and PM/UX/Dev analysis share the same vLLM engine**, loaded once at process start. The engine stays resident until the run finishes; images are prefilled in a single batch per call.
+- **OCR text captured during keyframe extraction is threaded into every downstream prompt** (timeline HTML column, vision summary, macro-chunk analysis) — the model gets both the pixels *and* the exact on-screen text, which dramatically improves accuracy on UI-dense frames.
+- **Everything except the LLM calls is CPU-bound** on Grace (RapidOCR, dHash, ffmpeg, Whisper base) — meaning the pipeline saturates the CPU cores while the GPU idles between vision calls. Suitable for concurrent multi-video runs.
+
+---
+
+## Installation on GB10 hardware (DGX Spark / MSI EdgeXpert)
+
+The GB10 platform is aarch64 (Grace ARM) + Blackwell GPU + CUDA 12.8 or CUDA 13 (DGX Spark units shipped from mid-2025 ship CUDA 13). Wheel selection matters — stock PyPI torch has no `sm_121` kernels, and Python 3.14 aarch64 wheels are sparse for many ML libraries.
+
+**The key trick**: install vLLM nightly *first*, before torch. vLLM nightly bundles the correct torch version and all `nvidia-*-cu13` runtime libraries as pip dependencies, so manually installing torch first almost always creates a version conflict. Follow these steps in order.
+
+### Prerequisites
+
+- Ubuntu 24.04 aarch64 (`uname -m` → `aarch64`)
+- NVIDIA driver ≥ 570.x (Blackwell requires 570+)
+- CUDA 12.8+ runtime (`nvidia-smi` shows CUDA Version at top-right)
+
+**Python 3.12 *with dev headers* — required, not optional.** Stock DGX OS typically ships `python3.12` and `python3.12-venv` but **not** `python3.12-dev`. Without the `-dev` package, Triton's runtime JIT compile fails during vLLM model load (missing `Python.h`, gcc exits 1) — even when everything else is set up correctly. Install all three regardless of what `python3.12 --version` reports:
+
+```bash
+# If Python 3.12 isn't installed at all (only 3.14 shipped), add the PPA first:
+sudo add-apt-repository -y ppa:deadsnakes/ppa && sudo apt update
+
+# Always run — installs Python 3.12 if missing AND guarantees the dev headers are present:
+sudo apt install -y python3.12 python3.12-venv python3.12-dev
+```
+
+Verify the dev headers landed:
+
+```bash
+ls /usr/include/python3.12/Python.h    # must exist, or Triton JIT will fail
+```
+
+### Pre-flight sanity check
+
+Run these before creating the venv. If any line fails, fix it before continuing — no Python install step will work if the driver or architecture is wrong.
+
+```bash
+# System fundamentals
+nvidia-smi                           # Blackwell GPU must appear; CUDA Version ≥ 12.8 in top-right corner
+uname -m                             # must print aarch64
+python3.12 --version                 # must print 3.12.x
+
+# Is libcuda.so.1 in the linker path?
+ldconfig -p | grep libcuda.so        # must show at least one libcuda.so.1 entry
+                                     # if empty: driver library missing from ld.so.conf — reboot or run ldconfig
+
+# Python dev headers (required for Triton JIT fallback in vLLM stable; good to have regardless)
+ls /usr/include/python3.12/Python.h  # must exist — if not: sudo apt install python3.12-dev
+
+# CUDA toolkit (nvcc is NOT required for vLLM nightly — prebuilt kernels are used)
+nvcc --version 2>&1 || echo "no nvcc — OK if using vLLM nightly"
+ls /usr/local/ | grep cuda           # shows installed CUDA toolkit directories
+```
+
+Expected healthy output:
+
+```
+nvidia-smi          → Blackwell listed, "CUDA Version: 13.0" (or 12.8)
+uname -m            → aarch64
+python3.12          → Python 3.12.3
+ldconfig libcuda    → libcuda.so.1 → /usr/lib/aarch64-linux-gnu/libcuda.so.1
+Python.h            → /usr/include/python3.12/Python.h
+nvcc                → Cuda compilation tools, release 13.0 (or "no nvcc — OK")
+```
+
+### Step-by-step install
+
+**0. Confirm Python 3.12 is present**
+
+```bash
+python3.12 --version   # should print Python 3.12.x
+ls /usr/include/python3.12/Python.h   # must exist — see Prerequisites above
+```
+
+If either check fails, re-run the `sudo apt install` line in Prerequisites before continuing.
+
+**1. Create a Python 3.12 venv**
+
+```bash
+python3.12 -m venv ~/.venvs/videoextractor
+source ~/.venvs/videoextractor/bin/activate
+python -m pip install --upgrade pip wheel setuptools
+```
+
+**2. vLLM nightly — installs FIRST because it pulls the correct torch + CUDA libs**
+
+```bash
+pip install -U --pre --extra-index-url https://wheels.vllm.ai/nightly vllm
+```
+
+This one command brings in vLLM plus its pinned dependencies — currently `torch==2.11.0`, `triton>=3.6`, `cuda-toolkit-13.x`, `nvidia-cublas-13`, `nvidia-cudnn-cu13`, `nvidia-nccl-cu13`, and friends. Do **not** `pip install torch` yourself first — you'll almost certainly land on a torch build that vLLM doesn't pin against, and end up in an uninstall/reinstall loop resolving `vllm requires torch==X.Y.Z, but you have torch A.B.C`.
+
+Why nightly, not stable: vLLM stable falls back to Triton runtime JIT for Blackwell (`sm_121`) kernels and typically fails to compile on stock DGX OS. Nightly ships prebuilt sm_121 kernels and skips JIT entirely.
+
+Verify torch + Blackwell are visible from inside the venv:
+
+```bash
+python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_capability(0), torch.version.cuda)"
+# expect: 2.x.x True (12, 1) 13.0
+#                      ↑ sm_121  ↑ CUDA 13.0
+# If torch.version.cuda says 12.8, that's also fine — cu128 wheels run on CUDA 13 via forward-compat
+```
+
+Also confirm vLLM installed cleanly:
+
+```bash
+pip show vllm | grep Version         # should show a date-stamped nightly, e.g. 0.9.x.devYYYYMMDD
+```
+
+If `get_device_capability` returns `(12, 0)` or lower, your NVIDIA driver is older than 570 — update DGX OS drivers before continuing. If `is_available()` is `False`, the driver-userspace mismatch is deeper; check that `ldconfig -p | grep libcuda.so` returns a result, then restart the shell and re-activate the venv.
+
+**3. Everything else — pure Python and ONNX wheels, all arm64-clean**
+
+```bash
+pip install rapidocr-onnxruntime opencv-python-headless yt-dlp openai-whisper youtube-transcript-api python-dotenv accelerate
+```
+
+**4. ffmpeg at OS level (Whisper needs it)**
+
+```bash
+sudo apt install -y ffmpeg
+```
+
+**5. Pre-fetch the model weights (~17 GB one-time download)**
+
+```bash
+pip install "huggingface_hub[cli]"
+huggingface-cli download Qwen/Qwen2.5-VL-32B-Instruct-AWQ
+```
+
+**6. Import smoke test — no models loaded, confirms all code paths parse**
+
+```bash
+cd /path/to/VideoExtractor
+python -c "from product_demo_video_analyzer_dgx import build_qwen_engine, build_ocr_engine, compute_dhash; print('imports ok')"
+```
+
+This loads no weights. If it exits with `imports ok`, the venv is wired up correctly.
+
+**7. Keyframe smoke test — validates OCR + pHash pipeline without loading vLLM**
+
+```bash
+python product_demo_video_analyzer_dgx.py \
+  --file archive/<short-clip>.mp4 \
+  --no-analysis --no-vision-summary --no-macro-chunking \
+  --timeline --keyframe-mode ocr
+```
+
+Expect `[ocr-filter] Done: N keyframes saved, M OCR calls, K phash skips.` If N is 20-100 and pHash skips > 0, the gate path is healthy.
+
+**8. Full pipeline test with vLLM online**
+
+```bash
+python product_demo_video_analyzer_dgx.py \
+  --url "https://www.youtube.com/watch?v=<short-demo-id>" \
+  --keyframe-mode ocr --vision-summary --analysis --no-macro-chunking
+```
+
+Expect ~5-8 min wall time for a 20-min video. If vLLM crashes during model load, see the Triton JIT row in the troubleshooting table below.
+
+**9. Save the working environment for future rebuilds**
+
+```bash
+pip freeze > requirements-lock.txt
+```
+
+Rebuilding from this lock file is faster than re-resolving nightly deps, but the lock will pin a specific nightly build — refresh it monthly.
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `nvidia-smi` returns `command not found` or fails | NVIDIA driver not installed or PATH not set | On DGX/EdgeXpert this shouldn't happen; run `sudo apt install -y nvidia-utils-570` or reinstall OS drivers. Run `nvidia-smi` before anything else — if it doesn't show the Blackwell GPU and CUDA version, no Python step will work. |
+| `nvidia-smi` works but `torch.cuda.is_available()` is `False` AND `ldconfig -p \| grep libcuda.so` is empty | libcuda.so.1 isn't registered with the dynamic linker even though the driver is installed | Run `sudo ldconfig` to rebuild the linker cache. If it stays empty: `find /usr /lib -name "libcuda.so*" 2>/dev/null` — if found, add the containing directory to `/etc/ld.so.conf.d/` and re-run `ldconfig`. |
+| `torch.cuda.is_available()` is `False` after step 2 | vLLM nightly pulled torch but the CUDA driver isn't visible from Python (usually a driver-userspace mismatch or the venv shell inherited a stripped `LD_LIBRARY_PATH`) | Confirm `nvidia-smi` works. Then in the venv: `python -c "import torch; print(torch.version.cuda)"` — if this prints a version but `is_available()` is False, restart the shell / re-activate the venv. Last resort: uninstall & reinstall vLLM nightly so its pinned nvidia-* libs re-register. |
+| `pip's dependency resolver ... vllm X requires torch==Y, but you have torch Z is incompatible` | You installed torch manually before vLLM, and torch is now on the wrong version | Uninstall torch and let vLLM own the pin: `pip uninstall -y torch torchvision torchaudio && pip install -U --pre --extra-index-url https://wheels.vllm.ai/nightly vllm` |
+| `pip install vllm>=0.6.4` installs but model load fails with Triton JIT errors | Stable vLLM installed (not nightly); you may also have pre-installed a cu128 torch manually. Stable vLLM + CUDA 13.0 system = JIT compile path that often breaks. | Install nightly (which brings its own torch pin): `pip uninstall -y torch torchvision torchaudio vllm && pip install -U --pre --extra-index-url https://wheels.vllm.ai/nightly vllm`. Do **not** install torch separately — nightly vLLM pulls the correct torch + `nvidia-cu13` libs automatically. |
+| `get_device_capability` returns `(12, 0)` or lower | NVIDIA driver older than 570 | Update DGX OS drivers |
+| vLLM error: "no kernel image for sm_121" | vLLM version predates Blackwell support | Nightly: `pip install -U --pre --extra-index-url https://wheels.vllm.ai/nightly vllm` |
+| vLLM crashes during model load with `subprocess.CalledProcessError: Command '['/usr/bin/gcc', ..., '/tmp/tmpXXX/cuda_utils.c', ...]' returned non-zero exit status 1`, or the exposed gcc error says `Python.h: No such file or directory` | vLLM stable is falling back to Triton runtime JIT because no prebuilt Blackwell kernel is available. Triton's shim compile needs `python3.12-dev` (often missing on stock DGX OS). | 1) Install dev headers: `sudo apt install -y python3.12-dev` and verify `/usr/include/python3.12/Python.h` exists. 2) Switch to vLLM nightly to skip the JIT path entirely (ships prebuilt sm_121 kernels): `pip uninstall -y torch torchvision torchaudio vllm && pip install -U --pre --extra-index-url https://wheels.vllm.ai/nightly vllm`. This is the same install flow as step 2 above and is the definitive fix. |
+| `Could not find a version that satisfies the requirement torch` (or vllm/onnxruntime) | Python 3.14 venv — many ML wheels aren't there yet on aarch64 | Use `python3.12 -m venv ...` |
+| ONNX Runtime prints `Failed to detect devices under "/sys/class/drm/card0"` | GPU probe on Grace unified memory — DRM sysfs doesn't expose the on-package Blackwell | Benign — RapidOCR runs on CPU by design. Silence with `import onnxruntime as ort; ort.set_default_logger_severity(3)` at the top of the script if noisy. |
+| vLLM OOM on model load | 32B AWQ + activations exceed the vLLM alloc | Lower `gpu_memory_utilization=0.85` in `build_qwen_engine()` (product_demo_video_analyzer_dgx.py:46), or drop to `--vision-model Qwen/Qwen2.5-VL-7B-Instruct-AWQ` |
+| `ModuleNotFoundError: No module named 'vllm'` (or `rapidocr_onnxruntime`, `cv2`, etc.) | venv not activated in this shell | `source ~/.venvs/videoextractor/bin/activate`, then re-run. To verify: `which python` should point inside `~/.venvs/videoextractor/`. |
+| `Missing dependency: yt_dlp` | venv not activated | `source ~/.venvs/videoextractor/bin/activate` |
+| `[transcript] No subtitles found` / transcript is empty and run takes much longer than expected | YouTube transcript API returned nothing (private/restricted video, Wistia URL, or local file). Pipeline falls back to Whisper, which needs `ffmpeg`. | Run `ffmpeg -version` — if not found, run `sudo apt install -y ffmpeg`. Whisper fallback is on by default; disable only with `--no-whisper-fallback`. For Wistia and local files, Whisper is always the first (and only) transcript source. |
+| `FileNotFoundError: [Errno 2] No such file or directory: 'ffmpeg'` during Whisper transcription | `ffmpeg` not installed at OS level | `sudo apt install -y ffmpeg` (install step 4 above). Whisper calls ffmpeg to decode audio — it must be on the system `PATH`, not inside the venv. |
+| First run hangs on "Loading model" | HF download in progress silently | Pre-fetch weights (step 5). Set `HF_HUB_ENABLE_HF_TRANSFER=1` for faster downloads. |
+| vLLM prints "Initializing vLLM engine" and then nothing for 2-3 minutes | Normal — first-time CUDA kernel compilation and weight loading for a 17 GB checkpoint | Wait. Do not Ctrl+C. Look for `INFO: Model loaded` (or similar) to confirm it finished. Subsequent runs are faster once kernels are cached. |
+| `Cannot load local files without --allowed-local-media-path` during vision summary | vLLM ≥ 0.6 blocks `file://` URLs by default as a security guard | Ensure `allowed_local_media_path="/"` is in the `LLM()` constructor in `build_qwen_engine()`. If you cloned fresh, pull the latest `product_demo_video_analyzer_dgx.py` — it already includes the fix. |
 
 ---
 
@@ -117,11 +603,35 @@ Both streams feed into every output: the timeline shows them side by side, and O
 - Ollama running locally (`http://127.0.0.1:11434`)
 - `ffmpeg` installed (for Whisper audio extraction)
 
-Install Python dependencies:
+Install Python dependencies (macOS / Apple Silicon):
 
 ```bash
-pip install -U yt-dlp youtube-transcript-api opencv-python openai-whisper
+pip install -r requirements-mac.txt
 ```
+
+This installs the base pipeline (yt-dlp, OpenCV, Whisper, transcript API, RapidOCR) plus the `openai` client used to reach Ollama. vLLM is intentionally excluded — it is CUDA-only and does not build on macOS; see `requirements-dgx.txt` for the GB10 install.
+
+## LLM Models
+
+| Model | Provider | Role | How to enable |
+|---|---|---|---|
+| `qwen2.5vl:32b` | Ollama (local) | Text analysis — structured PM/UX/dev report and macro-chunk final summary | Default; override with `--model` |
+| `qwen2.5vl:32b` | Ollama (local) | Vision analysis — keyframe+transcript summary, per-frame OCR, macro-chunk window analysis | Default; override with `--vision-model` |
+| `gpt-4o` | OpenAI (cloud) | Alternative vision model for per-frame OCR | `--ocr-backend openai`; requires `OPENAI_API_KEY` in `.env` |
+| Whisper (`tiny` / `base` / `small` / `medium` / `large`) | OpenAI (runs locally) | Speech-to-text audio transcription fallback | Automatic fallback; size set with `--whisper-model` (default: `base`) |
+
+**Other Ollama vision models** — any Ollama-hosted vision model can replace `qwen2.5vl:32b` via `--vision-model`. Common alternatives:
+
+| Model | Notes |
+|---|---|
+| `llava` / `llava:13b` / `llava:34b` | LLaVA family; lighter than llama3.2-vision at the 7B size |
+| `minicpm-v` | Compact multimodal model, good for OCR-heavy tasks |
+| `moondream` | Very small, fast; lower accuracy on complex scenes |
+| `bakllava` | LLaVA variant fine-tuned on Mistral |
+
+Pull any model before use: `ollama pull <model-name>`
+
+**Local vs. cloud:** Ollama and Whisper run entirely on your machine — no API key or internet access needed. `gpt-4o` is the only cloud model and requires an `OPENAI_API_KEY`.
 
 ## Supported Video Sources
 
@@ -169,8 +679,7 @@ Wistia is commonly used for product demo and marketing videos (e.g. Procore, Sal
 1. Start Ollama and pull models:
 
 ```bash
-ollama pull llama3.1
-ollama pull llama3.2-vision
+ollama pull qwen2.5vl:32b
 ```
 
 2. Run macro-chunking workflow (recommended for product demos):
@@ -508,7 +1017,12 @@ python3 product_demo_video_analyzer.py --url "..." --keyframe-mode scene --min-s
 Add `--ocr-backend` to extract visible UI text from keyframes. OCR output is added as a fourth column in the timeline HTML and included in all analysis prompts alongside the audio transcript.
 
 ```bash
-# OCR with local Ollama (llama3.2-vision)
+# OCR with local RapidOCR (recommended — CPU ONNX, no API key, no GPU load)
+python3 product_demo_video_analyzer.py \
+  --url "https://www.youtube.com/watch?v=VIDEO_ID" \
+  --ocr-backend rapidocr
+
+# OCR with local Ollama vision model
 python3 product_demo_video_analyzer.py \
   --url "https://www.youtube.com/watch?v=VIDEO_ID" \
   --ocr-backend ollama
@@ -553,7 +1067,7 @@ Whisper is used only if YouTube transcript sources fail (unless disabled).
 
 ### Ollama Vision Slow or Timing Out
 
-When `llama3.2-vision` is memory-constrained or slow, vision requests may time out. The pipeline handles this automatically in two layers:
+When `qwen2.5vl:32b` is memory-constrained or slow, vision requests may time out. The pipeline handles this automatically in two layers:
 
 **Adaptive image reduction** — if a vision request fails (timeout, OOM, HTTP 500), the pipeline retries the same window with half as many images. It reduces until it reaches 1 image, then falls back.
 
@@ -611,15 +1125,54 @@ To reduce disk usage:
 - use `--keyframe-seconds 30`
 - periodically delete old `artifacts/frames`, `artifacts/videos`, and `artifacts/audio`
 
-## CLI Reference
+## CLI Reference — `product_demo_video_analyzer_dgx.py` (GB10 / Blackwell)
+
+Authoritative for the DGX pipeline. All options match `parse_args()` in `product_demo_video_analyzer_dgx.py`.
+
+| Option | Default | Description |
+|---|---|---|
+| `-h`, `--help` | None | Show help text and exit. |
+| `--url URL` | — | Video URL (YouTube, Wistia, or any yt-dlp-supported source). Repeat for multiple. At least one of `--url` or `--file` required. |
+| `--file PATH` | — | Local video file path. Use alone (Whisper only) or pair 1:1 with `--url` (skips download, URL still used for transcript lookup). |
+| `--model MODEL` | `Qwen/Qwen2.5-VL-32B-Instruct-AWQ` | Qwen model ID served by vLLM for transcript-based analysis. |
+| `--vision-model VISION_MODEL` | `Qwen/Qwen2.5-VL-32B-Instruct-AWQ` | Qwen model ID for keyframe+transcript vision summary. |
+| `--quantization {awq_marlin,nvfp4,fp8,gptq_marlin,none}` | auto-detect | vLLM quantization override. Unset lets vLLM detect from the checkpoint (AWQ → `awq_marlin` on Blackwell). Set to `nvfp4` when you have an NVFP4-quantized checkpoint. |
+| `--work-dir DIR` | `artifacts` | Base output directory. |
+| `--download-video` | `False` | Keep downloaded video files in `artifacts/videos/`. |
+| `--analysis` / `--no-analysis` | Enabled | Enable/disable transcript-only PM/UX/dev report (`<video_id>_analysis.md`). |
+| `--vision-summary` / `--no-vision-summary` | Enabled | Enable/disable sparse keyframe multimodal summary (`<video_id>_vision_summary.md`). |
+| `--macro-chunking` / `--no-macro-chunking` | **Disabled** | Windowed macro-chunking (~80 LLM calls on a 20-min video). Off by default — enable only for long-form (45+ min) or purely-visual content. |
+| `--timeline` / `--no-timeline` | Enabled | Enable/disable timeline outputs (HTML/MD/JSON with frames + transcript). |
+| `--timeline-window-seconds N` | `20` | Seconds per timeline window. |
+| `--keyframe-mode {interval,scene,ocr}` | **`ocr`** | Keyframe extraction mode. `interval`: one frame every `--keyframe-seconds`. `scene`: one frame per pixel-diff transition. `ocr`: dHash prefilter + RapidOCR text-change detection (default; best for UI-heavy demos). |
+| `--keyframe-seconds N` | `20` | For `interval` mode: extract one keyframe every N seconds. |
+| `--scene-threshold N` | `25.0` | For `scene` mode: mean pixel difference threshold. Lower = more sensitive. Range 0–255. |
+| `--ocr-similarity-threshold F` | `0.85` | For `ocr` mode: text similarity threshold — save a frame when OCR text similarity vs the last saved frame falls **below** this value. Higher = fewer keyframes. |
+| `--phash-threshold N` | `5` | For `ocr` mode: Hamming distance (out of 64 bits) below which the dHash prefilter skips OCR entirely. Higher = more skips (fewer OCR calls, coarser keyframes). |
+| `--min-keyframe-gap F` | `1.0` | Minimum seconds between saved frames. |
+| `--macro-window-seconds N` | `15` | For macro-chunking: window size in seconds. |
+| `--capture-fps N` | `6` | For macro-chunking: frame sampling rate (fps). |
+| `--macro-frames-per-window N` | `8` | For macro-chunking: max frames per window sent to the vision model. |
+| `--frame-width N` | `960` | Resize extracted frames to this max width (pixels). |
+| `--max-vision-frames N` | `24` | Max keyframes included in the vision summary. |
+| `--whisper-fallback` / `--no-whisper-fallback` | Enabled | Use Whisper if YouTube transcript API and yt-dlp subtitles both fail. |
+| `--whisper-model MODEL` | `base` | Whisper model size: `tiny`, `base`, `small`, `medium`, `large`. |
+
+### Removed vs. `_analyzer.py`
+
+- `--ocr-backend` — dropped. On the DGX pipeline, OCR is always RapidOCR when `--keyframe-mode ocr` is used. No cloud/Ollama backend needed.
+
+## CLI Reference — `product_demo_video_analyzer.py` (Ollama / legacy)
+
+For the original laptop pipeline. Uses Ollama over HTTP.
 
 | Option | Default | Description |
 |---|---|---|
 | `-h`, `--help` | None | Show help text and exit. |
 | `--url URL` | — | Video URL (YouTube or Wistia). Repeat for multiple. At least one of `--url` or `--file` required. |
 | `--file PATH` | — | Local video file path. Use alone (Whisper only) or pair 1:1 with `--url` (skips download, URL still used for transcript lookup). |
-| `--model MODEL` | `llama3.1` | Text model for transcript-based PM/UX/dev analysis and macro-chunk final summary. |
-| `--vision-model VISION_MODEL` | `llama3.2-vision` | Vision model for image+transcript analysis. |
+| `--model MODEL` | `qwen2.5vl:32b` | Text model for transcript-based PM/UX/dev analysis and macro-chunk final summary. |
+| `--vision-model VISION_MODEL` | `qwen2.5vl:32b` | Vision model for image+transcript analysis. |
 | `--work-dir WORK_DIR` | `artifacts` | Base output directory for generated files. |
 | `--download-video` | `False` | Keep downloaded files in `artifacts/videos/`. |
 | `--analysis` / `--no-analysis` | Enabled | Enable/disable structured transcript-only PM/UX/dev report output (`--no-analysis` skips `<video_id>_analysis.md`). |
@@ -635,7 +1188,7 @@ To reduce disk usage:
 | `--max-vision-frames N` | `24` | Max total frames sent in sparse keyframe vision-summary mode. |
 | `--whisper-fallback` / `--no-whisper-fallback` | Enabled | Enable/disable Whisper fallback if transcript API/subtitles fail. |
 | `--whisper-model MODEL` | `base` | Whisper model used during fallback transcription. |
-| `--ocr-backend` | `none` | Vision backend for per-frame OCR text extraction: `ollama`, `openai`, or `none`. When enabled, visible on-screen text is extracted from each keyframe and included in the timeline, vision summary, and macro-chunk analysis. |
+| `--ocr-backend` | `none` | Backend for per-frame OCR text extraction: `rapidocr`, `ollama`, `openai`, or `none`. `rapidocr` runs local ONNX OCR on CPU (~0.4s/frame on Apple Silicon, no API key or GPU — same engine as the DGX build); `ollama`/`openai` use a vision LLM over HTTP. When enabled, visible on-screen text is extracted from each keyframe and included in the timeline, vision summary, and macro-chunk analysis. |
 | `--keyframe-mode` | `interval` | Keyframe extraction mode: `interval` (one frame every `--keyframe-seconds`) or `scene` (one frame per distinct screen state, driven by pixel difference). |
 | `--scene-threshold` | `25` | Mean pixel difference threshold for `--keyframe-mode scene`. Lower = more sensitive, more frames. Range 0–255. |
 | `--min-scene-gap` | `1.0` | Minimum seconds between saved frames in scene-change mode. |

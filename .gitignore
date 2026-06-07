@@ -1,3 +1,16 @@
 /artifacts/
 /.idea
 .env
+
+# Python
+__pycache__/
+*.py[cod]
+
+# macOS
+.DS_Store
+
+# Terraform — provider plugins/modules (237M) and state (may contain secrets)
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.backup
+/artifacts/frames/

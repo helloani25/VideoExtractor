@@ -1,5 +1,5 @@
 import argparse
-import base64
+import difflib
 import html
 import json
 import math
@@ -9,9 +9,9 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Any, Optional
-from urllib import error as urlerror
-from urllib import request as urlrequest
 from urllib.parse import parse_qs, urlparse
+
+import numpy as np
 
 from youtube_transcript_helpers import fetch_transcript_entries
 
@@ -27,89 +27,83 @@ except ImportError:
     pass
 
 try:
-    from openai import OpenAI as _OpenAI
+    from vllm import LLM, SamplingParams
 except ImportError:
-    _OpenAI = None
+    LLM = None
+    SamplingParams = None
 
 try:
-    from rapidocr_onnxruntime import RapidOCR as _RapidOCR
+    from rapidocr_onnxruntime import RapidOCR
 except ImportError:
-    _RapidOCR = None
-
-# Sentinel returned as the "model" for the local RapidOCR backend so
-# extract_text_from_frame knows to call the engine instead of an HTTP client.
-_RAPIDOCR_SENTINEL = "__rapidocr__"
-
-OCR_BACKENDS: dict[str, dict] = {
-    "ollama": {
-        "base_url": "http://localhost:11434/v1",
-        "model": "llama3.2-vision",
-        "api_key_env": None,
-    },
-    "openai": {
-        "base_url": None,
-        "model": "gpt-4o",
-        "api_key_env": "OPENAI_API_KEY",
-    },
-}
+    RapidOCR = None
 
 
-def build_ocr_client(backend: str):
-    if backend == "rapidocr":
-        if _RapidOCR is None:
-            raise RuntimeError(
-                "rapidocr-onnxruntime is not installed. Run: pip install rapidocr-onnxruntime"
-            )
-        # Local ONNX OCR on CPU (~0.4s/frame on Apple Silicon). Leaves the GPU free
-        # for the vision/analysis model and matches the DGX OCR engine. CoreML/Neural
-        # Engine is intentionally not used: benchmarked ~3.4x slower for this
-        # dynamic-shape model (per-input recompile + CoreML<->CPU tensor copies).
-        return _RapidOCR(), _RAPIDOCR_SENTINEL
-    if _OpenAI is None:
-        raise RuntimeError("openai package is not installed. Run: pip install openai")
-    cfg = OCR_BACKENDS[backend]
-    if cfg["api_key_env"]:
-        api_key = os.environ.get(cfg["api_key_env"])
-        if not api_key:
-            raise RuntimeError(
-                f"{cfg['api_key_env']} environment variable not set for OCR backend '{backend}'."
-            )
-    else:
-        api_key = "ollama"
-    kwargs: dict = {"api_key": api_key}
-    if cfg["base_url"]:
-        kwargs["base_url"] = cfg["base_url"]
-    return _OpenAI(**kwargs), cfg["model"]
+def build_qwen_engine(
+    model_id: str,
+    quantization: str | None = None,
+    max_model_len: int = 32768,
+    max_images: int = 32,
+    gpu_memory_utilization: float = 0.9,
+):
+    """Load Qwen2.5-VL via vLLM. On Blackwell, AWQ checkpoints auto-select the Marlin kernel;
+    pass quantization='nvfp4' with a pre-quantized NVFP4 checkpoint to hit the FP4 tensor cores."""
+    if LLM is None:
+        raise RuntimeError("vllm not installed. Run: pip install 'vllm>=0.6.4'")
 
-
-def extract_text_from_frame(client, model: str, frame_path: Path) -> str:
-    if model == _RAPIDOCR_SENTINEL:
-        result, _elapsed = client(str(frame_path))
-        lines = [item[1] for item in result] if result else []
-        return "\n".join(lines).strip()
-    with open(frame_path, "rb") as f:
-        b64 = base64.b64encode(f.read()).decode()
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-                    {
-                        "type": "text",
-                        "text": (
-                            "Extract ALL visible text from this video frame exactly as it appears. "
-                            "Include UI labels, headers, menu items, data values, and any on-screen text. "
-                            "Output only the extracted text, one item per line."
-                        ),
-                    },
-                ],
-            }
-        ],
-        max_tokens=1024,
+    print(
+        f"[qwen] Loading '{model_id}' via vLLM "
+        f"(quantization={quantization or 'auto'}, max_model_len={max_model_len})..."
     )
-    return response.choices[0].message.content.strip()
+    return LLM(
+        model=model_id,
+        dtype="auto",
+        quantization=quantization,
+        gpu_memory_utilization=gpu_memory_utilization,
+        max_model_len=max_model_len,
+        limit_mm_per_prompt={"image": max_images},
+        trust_remote_code=True,
+        allowed_local_media_path="/",
+    )
+
+
+def call_qwen(
+    engine,
+    prompt: str,
+    image_paths: list[Path],
+    max_tokens: int = 8192,
+    temperature: float = 0.0,
+) -> str:
+    """Run vLLM chat inference on Qwen2.5-VL with N images + a text prompt."""
+    content: list[dict[str, Any]] = [
+        {"type": "image_url", "image_url": {"url": f"file://{Path(p).resolve()}"}}
+        for p in image_paths
+    ]
+    content.append({"type": "text", "text": prompt})
+
+    sampling_params = SamplingParams(temperature=temperature, max_tokens=max_tokens)
+    outputs = engine.chat(
+        messages=[{"role": "user", "content": content}],
+        sampling_params=sampling_params,
+    )
+    return outputs[0].outputs[0].text.strip()
+
+
+def build_ocr_engine():
+    """Load RapidOCR (ONNX Runtime, CPU by default). ARM-friendly, wheel-only setup."""
+    if RapidOCR is None:
+        raise RuntimeError("rapidocr-onnxruntime not installed. Run: pip install rapidocr-onnxruntime")
+    return RapidOCR()
+
+
+def compute_dhash(frame_bgr, hash_size: int = 8) -> np.ndarray:
+    """Difference hash — cheap perceptual fingerprint. Returns a flat bool array of length hash_size**2."""
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    resized = cv2.resize(gray, (hash_size + 1, hash_size))
+    return (resized[:, 1:] > resized[:, :-1]).flatten()
+
+
+def hamming_distance(a: np.ndarray, b: np.ndarray) -> int:
+    return int((a != b).sum())
 
 
 def require_yt_dlp():
@@ -706,6 +700,102 @@ def extract_keyframes_scene_change(
     return saved
 
 
+def extract_keyframes_ocr_change(
+    video_path: Path,
+    output_dir: Path,
+    ocr_engine,
+    similarity_threshold: float,
+    min_gap_sec: float,
+    frame_width: int,
+    phash_threshold: int = 5,
+) -> tuple[list[Path], dict[str, str]]:
+    """Save a frame only when on-screen text changes significantly.
+
+    Two-stage filter: a cheap dHash prefilter skips OCR on visually-similar frames
+    (Hamming <= phash_threshold vs. last saved frame), then RapidOCR runs on
+    survivors and a text-similarity check gates the final save.
+    """
+    if cv2 is None:
+        print("OpenCV is not installed. Skipping OCR keyframe extraction.")
+        return [], {}
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        print("Could not open video for OCR keyframe extraction.")
+        return [], {}
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+    # Sample at ~1 FPS to bound work regardless of source frame rate
+    process_interval = int(round(fps)) if fps > 0 else 1
+
+    saved: list[Path] = []
+    keyframe_ocr: dict[str, str] = {}
+    last_text = ""
+    last_saved_hash: np.ndarray | None = None
+    last_saved_ts = -min_gap_sec
+    frame_idx = 0
+    saved_count = 0
+    ocr_calls = 0
+    phash_skips = 0
+
+    print(
+        f"[ocr-filter] Starting OCR-driven extraction "
+        f"(text_threshold={similarity_threshold}, phash_threshold={phash_threshold})..."
+    )
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        ts = frame_idx / fps if fps > 0 else frame_idx
+        if frame_idx % process_interval == 0 and (ts - last_saved_ts) >= min_gap_sec:
+            current_hash = compute_dhash(frame)
+
+            if last_saved_hash is not None and hamming_distance(current_hash, last_saved_hash) <= phash_threshold:
+                phash_skips += 1
+                frame_idx += 1
+                continue
+
+            ocr_result, _elapsed = ocr_engine(frame)
+            ocr_calls += 1
+            current_text_lines = [item[1] for item in ocr_result] if ocr_result else []
+            current_text = "\n".join(current_text_lines).strip()
+
+            if not last_text:
+                similarity = 0.0
+            else:
+                similarity = difflib.SequenceMatcher(None, last_text, current_text).ratio()
+
+            if not last_text or similarity < similarity_threshold:
+                if frame_width > 0:
+                    original_h, original_w = frame.shape[:2]
+                    if original_w > frame_width:
+                        ratio = frame_width / float(original_w)
+                        frame = cv2.resize(frame, (frame_width, max(1, int(original_h * ratio))))
+
+                output_path = output_dir / f"keyframe_{saved_count:04d}_{int(ts):06d}s.jpg"
+                cv2.imwrite(str(output_path), frame)
+                saved.append(output_path)
+                keyframe_ocr[output_path.name] = current_text
+
+                last_text = current_text
+                last_saved_hash = current_hash
+                last_saved_ts = ts
+                saved_count += 1
+                print(f"[ocr-filter] Saved keyframe {saved_count} at {int(ts)}s (text_sim={similarity:.2f})")
+
+        frame_idx += 1
+
+    cap.release()
+    print(
+        f"[ocr-filter] Done: {saved_count} keyframes saved, "
+        f"{ocr_calls} OCR calls, {phash_skips} phash skips."
+    )
+    return saved, keyframe_ocr
+
+
 def extract_windowed_macro_chunk_frames(
     video_path: Path,
     windows: list[dict[str, Any]],
@@ -855,165 +945,9 @@ def sample_evenly_spaced_indices(total_items: int, max_items: int) -> list[int]:
     return deduped
 
 
-def call_ollama_chat(
-    model: str,
-    messages: list[dict[str, Any]],
-    timeout_seconds: int = 600,
-    max_retries: int = 2,
-) -> str:
-    payload = json.dumps(
-        {"model": model, "stream": False, "messages": messages}
-    ).encode("utf-8")
-    req = urlrequest.Request(
-        "http://127.0.0.1:11434/api/chat",
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-
-    for attempt in range(max_retries + 1):
-        try:
-            with urlrequest.urlopen(req, timeout=timeout_seconds) as resp:
-                raw = resp.read().decode("utf-8")
-            data = json.loads(raw)
-            if data.get("error"):
-                raise RuntimeError(f"Ollama API returned an error: {data['error']}")
-            content = data.get("message", {}).get("content")
-            if not isinstance(content, str):
-                raise RuntimeError("Ollama response did not contain message.content text.")
-            return content
-        except urlerror.HTTPError as exc:
-            error_body = ""
-            try:
-                error_body = exc.read().decode("utf-8", errors="replace").strip()
-            except Exception:
-                error_body = ""
-            is_retryable = exc.code in {500, 502, 503, 504}
-            if is_retryable and attempt < max_retries:
-                time.sleep(min(8, 2**attempt))
-                continue
-            suffix = f" Body: {error_body[:500]}" if error_body else ""
-            raise RuntimeError(
-                f"Ollama HTTP error {exc.code} {exc.reason} at {req.full_url}.{suffix}"
-            ) from exc
-        except urlerror.URLError as exc:
-            raise RuntimeError(
-                "Could not reach Ollama at http://127.0.0.1:11434. Start Ollama first."
-            ) from exc
-        except TimeoutError as exc:
-            if attempt < max_retries:
-                time.sleep(min(8, 2**attempt))
-                continue
-            raise RuntimeError(
-                f"Ollama request timed out after {timeout_seconds}s. "
-                "For vision summary: try --max-vision-frames 6 or --keyframe-seconds 30. "
-                "For macro-chunking: try --macro-frames-per-window 4 or --capture-fps 2."
-            ) from exc
-        except json.JSONDecodeError as exc:
-            raise RuntimeError("Ollama returned malformed JSON.") from exc
-
-    raise RuntimeError("Ollama request failed after retries.")
-
-
-def is_ollama_available(timeout_seconds: int = 3) -> bool:
-    req = urlrequest.Request(
-        "http://127.0.0.1:11434/api/tags",
-        method="GET",
-    )
-    try:
-        with urlrequest.urlopen(req, timeout=timeout_seconds) as resp:
-            if resp.status != 200:
-                return False
-            json.loads(resp.read().decode("utf-8"))
-            return True
-    except Exception:
-        return False
-
-
-def call_ollama_vision_with_adaptive_images(
-    model: str,
-    prompt: str,
-    image_payloads: list[str],
-    timeout_seconds: int = 120,
-    min_images: int = 1,
-) -> str:
-    if not image_payloads:
-        raise RuntimeError("No image payloads available for vision request.")
-
-    total_images = len(image_payloads)
-    current_indices = list(range(total_images))
-    while len(current_indices) >= min_images:
-        current_images = [image_payloads[idx] for idx in current_indices]
-        # Scale timeout proportionally so fewer images fail faster
-        scaled_timeout = max(180, int(timeout_seconds * len(current_images) / total_images))
-        try:
-            return call_ollama_chat(
-                model=model,
-                messages=[
-                    {"role": "user", "content": prompt, "images": current_images}
-                ],
-                timeout_seconds=scaled_timeout,
-                max_retries=0,
-            )
-        except RuntimeError as exc:
-            message = str(exc).lower()
-            is_server_error = (
-                "http error 500" in message
-                or "http error 502" in message
-                or "http error 503" in message
-                or "http error 504" in message
-            )
-            is_capacity_error = (
-                "internal server error" in message
-                or "out of memory" in message
-                or "timed out" in message
-            )
-            if len(current_indices) <= min_images or not (is_server_error or is_capacity_error):
-                raise
-            next_count = max(min_images, len(current_indices) // 2)
-            if next_count == len(current_indices):
-                raise
-            print(
-                f"[ollama] Vision request failed; retrying with fewer images "
-                f"({len(current_indices)} -> {next_count})."
-            )
-            time.sleep(4)
-            relative_indices = sample_evenly_spaced_indices(
-                len(current_indices), next_count
-            )
-            current_indices = [current_indices[i] for i in relative_indices]
-
-    raise RuntimeError("Vision request failed after adaptive image retries.")
-
-
-def encode_image_base64_for_ollama(
-    image_path: Path,
-    max_width: int = 640,
-    jpeg_quality: int = 70,
-) -> str:
-    if cv2 is None:
-        return base64.b64encode(image_path.read_bytes()).decode("utf-8")
-
-    frame = cv2.imread(str(image_path))
-    if frame is None:
-        return base64.b64encode(image_path.read_bytes()).decode("utf-8")
-
-    height, width = frame.shape[:2]
-    if width > max_width:
-        ratio = max_width / float(width)
-        resized_h = max(1, int(height * ratio))
-        frame = cv2.resize(frame, (max_width, resized_h))
-
-    encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), max(40, min(90, jpeg_quality))]
-    ok, encoded = cv2.imencode(".jpg", frame, encode_params)
-    if not ok:
-        return base64.b64encode(image_path.read_bytes()).decode("utf-8")
-    return base64.b64encode(encoded.tobytes()).decode("utf-8")
-
-
 def analyze_transcript_only_vision_fallback(
     transcript: str,
-    model: str,
+    engine,
     video_url: str,
     failure_reason: str,
 ) -> str:
@@ -1038,16 +972,12 @@ Use only transcript evidence and mark assumptions explicitly.
 Transcript:
 {trimmed}
 """
-    return call_ollama_chat(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-        timeout_seconds=120,
-    )
+    return call_qwen(engine, prompt, [])
 
 
 def analyze_macro_chunk_transcript_fallback(
     video_url: str,
-    model: str,
+    engine,
     window: dict[str, Any],
     failure_reason: str,
 ) -> str:
@@ -1069,24 +999,17 @@ Respond in markdown with:
 - **Entity/data objects involved**
 - **UX notes**
 """
-    return call_ollama_chat(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-        timeout_seconds=300,
-    )
+    return call_qwen(engine, prompt, [])
 
 
-def analyze_with_ollama_vision(
+def analyze_with_qwen_vision(
     transcript: str,
     keyframe_paths: list[Path],
-    model: str,
+    engine,
     video_url: str,
     ocr_text: str = "",
 ) -> str:
     transcript_trimmed = transcript[:12000]
-    images = []
-    for path in keyframe_paths:
-        images.append(encode_image_base64_for_ollama(path))
 
     ocr_section = (
         f"\nOn-screen text extracted via OCR from keyframes:\n{ocr_text[:8000]}\n"
@@ -1099,7 +1022,7 @@ You are reviewing a construction software demo.
 Inputs:
 - Video URL: {video_url}
 - Transcript text (from Whisper/captions)
-- Chronological keyframes sampled every fixed interval
+- Chronological keyframes sampled from the video
 {ocr_section}
 Return a concise, practical markdown report with these headings:
 1. # Full Demo Summary
@@ -1115,26 +1038,21 @@ Use visuals, transcript, and OCR evidence together. If uncertain, mark as assump
 Transcript:
 {transcript_trimmed}
 """
-    return call_ollama_vision_with_adaptive_images(
-        model=model,
-        prompt=prompt,
-        image_payloads=images,
-        timeout_seconds=900,
-    )
+    return call_qwen(engine, prompt, keyframe_paths)
 
 
 def analyze_macro_chunk_window_with_vision(
     video_url: str,
-    vision_model: str,
+    engine,
     frames_dir: Path,
     window: dict[str, Any],
 ) -> str:
     frame_files = window.get("frame_files", [])
-    image_payloads = []
+    image_paths = []
     for name in frame_files:
         path = frames_dir / name
         if path.exists():
-            image_payloads.append(encode_image_base64_for_ollama(path, max_width=480))
+            image_paths.append(path)
 
     transcript_text = window.get("transcript") or "[No transcript in this interval]"
     ocr_text = window.get("ocr_text", "").strip()
@@ -1142,7 +1060,7 @@ def analyze_macro_chunk_window_with_vision(
     start_label = seconds_to_hhmmss(window["start"])
     end_label = seconds_to_hhmmss(window["end"])
     prompt = f"""
-You are analyzing one 15-second workflow chunk from a construction software demo.
+You are analyzing one workflow chunk from a construction software demo.
 
 Video URL: {video_url}
 Window: {start_label} - {end_label}
@@ -1156,17 +1074,12 @@ Respond in markdown with:
 - **Entity/data objects involved**
 - **UX notes**
 """
-    return call_ollama_vision_with_adaptive_images(
-        model=vision_model,
-        prompt=prompt,
-        image_payloads=image_payloads,
-        timeout_seconds=120,
-    )
+    return call_qwen(engine, prompt, image_paths)
 
 
 def compile_macro_chunk_full_summary(
     video_url: str,
-    model: str,
+    engine,
     chunk_analyses: list[dict[str, Any]],
 ) -> str:
     timeline_blocks = []
@@ -1193,11 +1106,7 @@ Format:
 Windowed analyses:
 {joined}
 """
-    return call_ollama_chat(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-        timeout_seconds=120,
-    )
+    return call_qwen(engine, prompt, [])
 
 
 def write_macro_chunk_report(
@@ -1379,13 +1288,13 @@ def build_timeline_html(
 """
 
 
-def analyze_transcript_with_ollama(
+def analyze_transcript_with_qwen(
     transcript: str,
-    model: str,
+    engine,
     video_url: str,
 ) -> str:
     trimmed = transcript[:45000]
-    prompt = f"""You are analyzing a software product demo transcript.
+    prompt = f"""You are analyzing a video transcript (software demo or industry discussion).
 
 Video URL: {video_url}
 
@@ -1396,6 +1305,11 @@ Write in markdown using these exact section headings:
 **Summary**
 1-2 paragraph plain-language overview of what the product does and who it's for.
 
+**Industry Context & Pain Points**
+- What specific industry problems or "pain points" are discussed?
+- Who is the primary target audience?
+- What are the core market drivers mentioned?
+
 **Key Entities**
 For each important object in the product (data, UI, business concept), write:
 - **Entity name**
@@ -1405,7 +1319,7 @@ For each important object in the product (data, UI, business concept), write:
   - Relationships: how it connects to other entities
 
 **Workflow**
-Number each step. For each:
+Number each step of any demo or process shown. For each:
 - Stage name
   - Actor: who does this
   - Goal: why this step exists
@@ -1444,11 +1358,7 @@ Transcript:
 {trimmed}
 """
 
-    return call_ollama_chat(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-        timeout_seconds=120,
-    )
+    return call_qwen(engine, prompt, [])
 
 
 def json_or_none(text: str) -> Optional[dict[str, Any]]:
@@ -1614,27 +1524,26 @@ def run(
     run_macro_chunking: bool,
     use_whisper_fallback: bool,
     whisper_model: str,
-    ocr_backend: str = "none",
     keyframe_mode: str = "interval",
     scene_threshold: float = 25.0,
     min_scene_gap: float = 1.0,
     video_files: list[str] | None = None,
+    ocr_similarity_threshold: float = 0.85,
+    phash_threshold: int = 5,
+    quantization: str | None = None,
 ) -> None:
     reports_dir = work_dir / "reports"
     frames_root = work_dir / "frames"
     reports_dir.mkdir(parents=True, exist_ok=True)
     frames_root.mkdir(parents=True, exist_ok=True)
 
-    need_ollama = run_analysis or run_vision_summary or run_macro_chunking
-    ollama_available = True
-    if need_ollama:
-        ollama_available = is_ollama_available()
-        if not ollama_available:
-            print(
-                "[ollama] Not reachable at http://127.0.0.1:11434. "
-                "Transcript and timeline outputs can still be generated, "
-                "but analysis, vision summary, and macro-chunking will be skipped."
-            )
+    qwen_engine = None
+    if run_analysis or run_vision_summary or run_macro_chunking:
+        qwen_engine = build_qwen_engine(vision_model, quantization=quantization)
+
+    ocr_engine = None
+    if keyframe_mode == "ocr":
+        ocr_engine = build_ocr_engine()
 
     # Build unified input list: each entry is (url_or_none, local_file_or_none).
     # --url alone:        (url, None)   — download + full transcript chain
@@ -1672,7 +1581,9 @@ def run(
         else:
             video_id = local_file.stem  # type: ignore[union-attr]
 
-        # Display/prompt label — never None; keeps file-only runs from crashing html.escape(None)
+        # Non-None label for report headers and LLM prompts (file-only runs have url=None).
+        # Distinct from `url`, which stays None when there's no remote source so download /
+        # transcript-API code paths correctly skip themselves.
         source_label = url or (str(local_file) if local_file else video_id)
 
         # Determine video_path — use local file if provided, else download
@@ -1745,9 +1656,20 @@ def run(
 
         # Extract keyframes once — shared by timeline and vision summary
         keyframes: list[Path] = []
+        keyframe_ocr: dict[str, str] = {}
         keyframes_dir = frames_root / video_id / "keyframes"
         if (generate_timeline or run_vision_summary) and video_path is not None:
-            if keyframe_mode == "scene":
+            if keyframe_mode == "ocr":
+                keyframes, keyframe_ocr = extract_keyframes_ocr_change(
+                    video_path=video_path,
+                    output_dir=keyframes_dir,
+                    ocr_engine=ocr_engine,
+                    similarity_threshold=ocr_similarity_threshold,
+                    min_gap_sec=min_scene_gap,
+                    frame_width=frame_width,
+                    phash_threshold=phash_threshold,
+                )
+            elif keyframe_mode == "scene":
                 print(
                     f"[{video_id}] Extracting keyframes on scene change "
                     f"(threshold={scene_threshold}, min_gap={min_scene_gap}s)..."
@@ -1769,17 +1691,6 @@ def run(
                 )
             print(f"[{video_id}] {len(keyframes)} keyframes saved to {keyframes_dir}")
 
-        keyframe_ocr: dict[str, str] = {}
-        if ocr_backend != "none" and keyframes:
-            ocr_client, ocr_model = build_ocr_client(ocr_backend)
-            print(f"[{video_id}] Running OCR on {len(keyframes)} keyframes (backend: {ocr_backend})...")
-            for kf in keyframes:
-                try:
-                    keyframe_ocr[kf.name] = extract_text_from_frame(ocr_client, ocr_model, kf)
-                except Exception as e:
-                    print(f"[{video_id}] OCR failed for {kf.name}: {e}")
-                    keyframe_ocr[kf.name] = ""
-
         if generate_timeline:
             duration = get_video_duration_seconds(video_path) if video_path else None
             windows = build_time_windows(segments, timeline_window_seconds, duration)
@@ -1793,9 +1704,7 @@ def run(
                 f"{reports_dir / f'{video_id}_timeline.html'} and {reports_dir / f'{video_id}_timeline.md'}"
             )
 
-        if run_macro_chunking and not ollama_available:
-            print(f"[{video_id}] Skipping macro-chunking: Ollama is unavailable.")
-        elif run_macro_chunking:
+        if run_macro_chunking:
             if video_path is None and url:
                 print(f"[{video_id}] Downloading video for macro-chunking...")
                 video_path = download_video(url, video_id, work_dir)
@@ -1825,11 +1734,11 @@ def run(
                     try:
                         analysis = analyze_macro_chunk_window_with_vision(
                             video_url=source_label,
-                            vision_model=vision_model,
+                            engine=qwen_engine,
                             frames_dir=macro_frames_dir,
                             window=window,
                         )
-                    except RuntimeError as exc:
+                    except Exception as exc:
                         print(
                             f"[{video_id}] Vision chunk failed "
                             f"({seconds_to_hhmmss(window['start'])}-{seconds_to_hhmmss(window['end'])}): {exc}"
@@ -1841,13 +1750,13 @@ def run(
                         try:
                             analysis = analyze_macro_chunk_transcript_fallback(
                                 video_url=source_label,
-                                model=model,
+                                engine=qwen_engine,
                                 window=window,
                                 failure_reason=str(exc),
                             )
-                        except RuntimeError:
+                        except Exception:
                             transcript_text = window.get("transcript") or "[No transcript for this window]"
-                            analysis = f"**Transcript only** (Ollama unavailable):\n\n{transcript_text}"
+                            analysis = f"**Transcript only** (Qwen unavailable):\n\n{transcript_text}"
                     chunk_analyses.append(
                         {
                             "start": window["start"],
@@ -1871,10 +1780,10 @@ def run(
                     try:
                         full_summary = compile_macro_chunk_full_summary(
                             video_url=source_label,
-                            model=model,
+                            engine=qwen_engine,
                             chunk_analyses=chunk_analyses,
                         )
-                    except RuntimeError as exc:
+                    except Exception as exc:
                         print(f"[{video_id}] Macro-chunk summary failed: {exc}")
                     else:
                         macro_summary_output = reports_dir / f"{video_id}_macro_chunk_summary.md"
@@ -1883,69 +1792,38 @@ def run(
                 else:
                     print(f"[{video_id}] Macro-chunking extracted no usable frame windows.")
 
-        if run_vision_summary and not ollama_available:
-            print(f"[{video_id}] Skipping vision summary: Ollama is unavailable.")
-        elif run_vision_summary:
-            # Keyframes may already be extracted above; only extract now if not done yet
-            if not keyframes:
-                if video_path is None and url:
-                    print(f"[{video_id}] Downloading video for vision summary...")
-                    video_path = download_video(url, video_id, work_dir)
-                if video_path is not None:
-                    if keyframe_mode == "scene":
-                        print(
-                            f"[{video_id}] Extracting keyframes on scene change "
-                            f"(threshold={scene_threshold}, min_gap={min_scene_gap}s)..."
-                        )
-                        keyframes = extract_keyframes_scene_change(
-                            video_path=video_path,
-                            output_dir=keyframes_dir,
-                            threshold=scene_threshold,
-                            min_gap_sec=min_scene_gap,
-                            frame_width=frame_width,
-                        )
-                    else:
-                        print(f"[{video_id}] Extracting keyframes every {keyframe_seconds}s...")
-                        keyframes = extract_keyframes_every_x_seconds(
-                            video_path=video_path,
-                            output_dir=keyframes_dir,
-                            every_seconds=keyframe_seconds,
-                            frame_width=frame_width,
-                        )
-
+        if run_vision_summary:
             if not keyframes:
                 print(f"[{video_id}] Skipping vision summary: no keyframes extracted.")
             else:
                 selected_keyframes = sample_keyframes(keyframes, max_vision_frames)
                 print(
-                    f"[{video_id}] Running Ollama vision summary with model "
-                    f"'{vision_model}' on {len(selected_keyframes)} keyframes..."
+                    f"[{video_id}] Running Native Qwen vision summary on {len(selected_keyframes)} keyframes..."
                 )
                 full_ocr_text = "\n\n".join(
                     t for t in keyframe_ocr.values() if t
                 ) if keyframe_ocr else ""
                 try:
-                    summary = analyze_with_ollama_vision(
+                    summary = analyze_with_qwen_vision(
                         transcript=full_transcript,
                         keyframe_paths=selected_keyframes,
-                        model=vision_model,
-                        video_url=url,
+                        engine=qwen_engine,
+                        video_url=source_label,
                         ocr_text=full_ocr_text,
                     )
-                except RuntimeError as exc:
+                except Exception as exc:
                     print(f"[{video_id}] Vision summary failed: {exc}")
                     print(
-                        f"[{video_id}] Falling back to transcript-only summary "
-                        f"with model '{model}'."
+                        f"[{video_id}] Falling back to transcript-only summary."
                     )
                     try:
                         summary = analyze_transcript_only_vision_fallback(
                             transcript=full_transcript,
-                            model=model,
-                            video_url=url,
+                            engine=qwen_engine,
+                            video_url=source_label,
                             failure_reason=str(exc),
                         )
-                    except RuntimeError as fallback_exc:
+                    except Exception as fallback_exc:
                         summary = (
                             "# Full Demo Summary\n\n"
                             "Vision summary failed and transcript-only fallback also failed.\n\n"
@@ -1956,25 +1834,22 @@ def run(
                 vision_output.write_text(summary, encoding="utf-8")
                 print(f"[{video_id}] Vision summary report: {vision_output}")
 
-        if run_analysis and not ollama_available:
-            print(f"[{video_id}] Skipping transcript analysis: Ollama is unavailable.")
-        elif run_analysis:
-            print(f"[{video_id}] Running Ollama analysis with model '{model}'...")
+        if run_analysis:
+            print(f"[{video_id}] Running Native Qwen analysis...")
             try:
-                raw = analyze_transcript_with_ollama(full_transcript, model, source_label)
-            except RuntimeError as exc:
+                raw = analyze_transcript_with_qwen(full_transcript, qwen_engine, source_label)
+            except Exception as exc:
                 print(f"[{video_id}] Analysis failed: {exc}")
                 continue
-            output = f"# Demo Analysis\n\nSource: {url or local_file}\n\n{raw}"
+            output = f"# Demo Analysis\n\nSource: {source_label}\n\n{raw}"
             output_file = reports_dir / f"{video_id}_analysis.md"
             output_file.write_text(output, encoding="utf-8")
             print(f"[{video_id}] Analysis report: {output_file}")
 
 
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Extract YouTube frames + transcript timeline and generate PM/UX/dev analysis via Ollama."
+        description="Extract YouTube frames + transcript timeline and generate PM/UX/dev analysis via Native Qwen2.5-VL."
     )
     parser.add_argument(
         "--url",
@@ -1997,13 +1872,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model",
-        default="qwen2.5vl:32b",
-        help="Ollama model name for transcript analysis (default: qwen2.5vl:32b).",
+        default="Qwen/Qwen2.5-VL-32B-Instruct-AWQ",
+        help="Qwen model ID served by vLLM (default: Qwen/Qwen2.5-VL-32B-Instruct-AWQ).",
     )
     parser.add_argument(
         "--vision-model",
-        default="qwen2.5vl:32b",
-        help="Ollama vision model for keyframe+transcript summary (default: qwen2.5vl:32b).",
+        default="Qwen/Qwen2.5-VL-32B-Instruct-AWQ",
+        help="Qwen model ID for vision summary served by vLLM (default: Qwen/Qwen2.5-VL-32B-Instruct-AWQ).",
+    )
+    parser.add_argument(
+        "--quantization",
+        choices=["awq_marlin", "nvfp4", "fp8", "gptq_marlin", "none"],
+        default=None,
+        help=(
+            "vLLM quantization override. Default (unset) lets vLLM auto-detect from the "
+            "checkpoint config — AWQ checkpoints auto-select awq_marlin on Blackwell. "
+            "Set to 'nvfp4' when using a pre-quantized NVFP4 checkpoint."
+        ),
     )
     parser.add_argument(
         "--work-dir",
@@ -2030,10 +1915,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--macro-chunking",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help=(
-            "Enable or disable windowed macro-chunking "
-            "(6 fps capture grouped into 15s windows by default)."
+            "Windowed macro-chunking: 6 fps capture grouped into 15s windows, one LLM "
+            "vision call per window. Off by default — the OCR-gated keyframe pipeline "
+            "usually covers the same ground with one call. Enable for long-form videos "
+            "(45+ min) or purely-visual content where per-window granularity matters."
         ),
     )
     parser.add_argument(
@@ -2082,7 +1969,7 @@ def parse_args() -> argparse.Namespace:
         "--max-vision-frames",
         type=int,
         default=24,
-        help="Maximum keyframes sent to Ollama vision model (default: 24).",
+        help="Max keyframes to include in the vision summary (default: 24).",
     )
     parser.add_argument(
         "--whisper-fallback",
@@ -2096,42 +1983,42 @@ def parse_args() -> argparse.Namespace:
         help="Whisper model for fallback transcription (default: base).",
     )
     parser.add_argument(
-        "--ocr-backend",
-        choices=["rapidocr", "ollama", "openai", "none"],
-        default="none",
-        help=(
-            "Backend for per-frame OCR text extraction (default: none). "
-            "'rapidocr' runs local ONNX OCR on CPU (fast, no API/GPU needed); "
-            "'ollama'/'openai' use a vision LLM over HTTP."
-        ),
-    )
-    parser.add_argument(
         "--keyframe-mode",
-        choices=["interval", "scene"],
-        default="interval",
+        choices=["interval", "scene", "ocr"],
+        default="ocr",
         help=(
             "Keyframe extraction mode. "
-            "'interval' saves one frame every --keyframe-seconds (default). "
-            "'scene' saves a frame only when the screen visually changes, "
-            "controlled by --scene-threshold and --min-scene-gap."
+            "'interval' saves one frame every --keyframe-seconds. "
+            "'scene' saves a frame on visual pixel change. "
+            "'ocr' uses a dHash prefilter + RapidOCR text-change detection (default)."
         ),
     )
     parser.add_argument(
         "--scene-threshold",
         type=float,
         default=25.0,
-        metavar="0-255",
+        help="Mean pixel difference threshold for scene-change detection (default: 25).",
+    )
+    parser.add_argument(
+        "--ocr-similarity-threshold",
+        type=float,
+        default=0.85,
+        help="Text similarity threshold for OCR-based keyframing (default: 0.85).",
+    )
+    parser.add_argument(
+        "--phash-threshold",
+        type=int,
+        default=5,
         help=(
-            "Mean pixel difference threshold for scene-change keyframe mode (default: 25). "
-            "Lower values are more sensitive and produce more frames."
+            "Hamming-distance threshold (out of 64) for the dHash prefilter in ocr mode. "
+            "Frames within this distance of the last saved frame skip OCR entirely (default: 5)."
         ),
     )
     parser.add_argument(
-        "--min-scene-gap",
+        "--min-keyframe-gap",
         type=float,
         default=1.0,
-        metavar="SEC",
-        help="Minimum seconds between saved frames in scene-change mode (default: 1.0).",
+        help="Minimum seconds between saved frames (default: 1.0).",
     )
     return parser.parse_args()
 
@@ -2162,8 +2049,10 @@ if __name__ == "__main__":
         run_macro_chunking=args.macro_chunking,
         use_whisper_fallback=args.whisper_fallback,
         whisper_model=args.whisper_model,
-        ocr_backend=args.ocr_backend,
         keyframe_mode=args.keyframe_mode,
         scene_threshold=args.scene_threshold,
-        min_scene_gap=args.min_scene_gap,
+        min_scene_gap=args.min_keyframe_gap,
+        ocr_similarity_threshold=args.ocr_similarity_threshold,
+        phash_threshold=args.phash_threshold,
+        quantization=(None if args.quantization in (None, "none") else args.quantization),
     )

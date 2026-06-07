@@ -1,13 +1,21 @@
-# Core video processing
-opencv-python
-yt-dlp
+# Base requirements — install on any platform (Mac dev + DGX).
+# Do NOT add vLLM here: it is CUDA-only and pins torch==2.6.0, which breaks
+# installation on macOS / Python 3.14. See requirements-mac.txt / requirements-dgx.txt.
 
-# Transcription
+# Core video processing
+opencv-python-headless
+yt-dlp
+numpy
+
+# Transcription (pulls in torch)
 openai-whisper
 torch
+torchvision
+torchaudio
 
-# Vision / LLM backends
-openai
+# OCR — RapidOCR via ONNX Runtime (CPU, ARM-friendly). Used by the keyframe OCR
+# path on both platforms: DGX's ocr keyframe mode and Mac's --ocr-backend rapidocr.
+rapidocr-onnxruntime
 
 # Transcript APIs
 youtube-transcript-api

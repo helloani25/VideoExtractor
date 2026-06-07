@@ -1,0 +1,17 @@
+# DGX / CUDA (Blackwell GB10) — GPU box only. Does NOT install on macOS.
+#
+# ⚠️  NOT a from-scratch installer. On a FRESH Blackwell box, follow the README
+#     "Installation on GB10 hardware" steps FIRST — vLLM nightly must be installed
+#     BEFORE torch. If you run this file on a clean venv, the `-r requirements.txt`
+#     line pulls PyPI torch ahead of vLLM and `vllm>=0.6.4` pulls *stable* vLLM —
+#     both fail on sm_121 (the exact breakage the README troubleshooting resolved).
+#     Only run this once the README manual install has succeeded and the venv
+#     already has vLLM nightly + its torch; pip will then see them satisfied.
+
+-r requirements.txt
+
+# Vision / LLM — vLLM serves Qwen2.5-VL on Blackwell via AWQ-Marlin or NVFP4
+vllm>=0.6.4
+accelerate
+
+# Note: rapidocr-onnxruntime (OCR-gated keyframe pipeline) is in base requirements.txt.

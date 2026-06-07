@@ -1,0 +1,11 @@
+# macOS dev install (Apple Silicon).
+#   python -m pip install -r requirements-mac.txt
+#
+# LLM inference runs via Ollama (separate app, `ollama serve`), reached over its
+# OpenAI-compatible HTTP API — so no local model-serving package is needed here.
+# vLLM is intentionally absent: CUDA-only, does not build on macOS.
+
+-r requirements.txt
+
+# Ollama / OpenAI-compatible HTTP client
+openai
