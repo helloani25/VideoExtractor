@@ -1,0 +1,16 @@
+# Core video processing
+opencv-python
+yt-dlp
+
+# Transcription
+openai-whisper
+torch
+
+# Vision / LLM backends
+openai
+
+# Transcript APIs
+youtube-transcript-api
+
+# Utilities
+python-dotenv
