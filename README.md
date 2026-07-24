@@ -206,8 +206,8 @@ Each video gets its own output directory under `artifacts/reports/<video_id>/` a
 
 ```bash
 python3 product_demo_video_analyzer_dgx.py \
-  --file archive/demo_v1.mp4 \
-  --file archive/demo_v2.mp4 \
+  --file artifacts/demo_v1.mp4 \
+  --file artifacts/demo_v2.mp4 \
   --keyframe-mode ocr
 ```
 
@@ -217,14 +217,14 @@ Pass `--url` and `--file` in matched order. The n-th `--url` is paired with the 
 
 ```bash
 python3 product_demo_video_analyzer_dgx.py \
-  --url "https://youtu.be/VIDEO_ID_1" --file archive/demo_v1.mp4 \
-  --url "https://youtu.be/VIDEO_ID_2" --file archive/demo_v2.mp4
+  --url "https://youtu.be/VIDEO_ID_1" --file artifacts/demo_v1.mp4 \
+  --url "https://youtu.be/VIDEO_ID_2" --file artifacts/demo_v2.mp4
 ```
 
 **Shell loop for a whole folder** (useful when you have many local files and no remote URL):
 
 ```bash
-for f in archive/*.mp4; do
+for f in artifacts/*.mp4; do
   python3 product_demo_video_analyzer_dgx.py \
     --file "$f" \
     --keyframe-mode ocr \
@@ -447,7 +447,7 @@ This loads no weights. If it exits with `imports ok`, the venv is wired up corre
 
 ```bash
 python3 product_demo_video_analyzer_dgx.py \
-  --file archive/<short-clip>.mp4 \
+  --file artifacts/<short-clip>.mp4 \
   --no-analysis --no-vision-summary --no-macro-chunking \
   --timeline --keyframe-mode ocr
 ```
