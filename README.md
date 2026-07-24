@@ -178,7 +178,7 @@ With OCR-gated keyframes, that redundancy disappears — keyframes are already s
 ## Recommended run on GB10 hardware
 
 ```bash
-python product_demo_video_analyzer_dgx.py \
+python3 product_demo_video_analyzer_dgx.py \
   --url "https://youtu.be/..." \
   --keyframe-mode ocr \
   --phash-threshold 5
@@ -193,7 +193,7 @@ That's it. `--analysis`, `--vision-summary`, and `--timeline` are on by default;
 **Multiple YouTube/Wistia URLs:**
 
 ```bash
-python product_demo_video_analyzer_dgx.py \
+python3 product_demo_video_analyzer_dgx.py \
   --url "https://youtu.be/VIDEO_ID_1" \
   --url "https://youtu.be/VIDEO_ID_2" \
   --url "https://youtu.be/VIDEO_ID_3" \
@@ -205,7 +205,7 @@ Each video gets its own output directory under `artifacts/reports/<video_id>/` a
 **Multiple local files:**
 
 ```bash
-python product_demo_video_analyzer_dgx.py \
+python3 product_demo_video_analyzer_dgx.py \
   --file archive/demo_v1.mp4 \
   --file archive/demo_v2.mp4 \
   --keyframe-mode ocr
@@ -216,7 +216,7 @@ python product_demo_video_analyzer_dgx.py \
 Pass `--url` and `--file` in matched order. The n-th `--url` is paired with the n-th `--file`. The URL is used to fetch a YouTube transcript (faster than Whisper); the local `.mp4` is decoded for frames and Whisper fallback — no re-download.
 
 ```bash
-python product_demo_video_analyzer_dgx.py \
+python3 product_demo_video_analyzer_dgx.py \
   --url "https://youtu.be/VIDEO_ID_1" --file archive/demo_v1.mp4 \
   --url "https://youtu.be/VIDEO_ID_2" --file archive/demo_v2.mp4
 ```
@@ -225,7 +225,7 @@ python product_demo_video_analyzer_dgx.py \
 
 ```bash
 for f in archive/*.mp4; do
-  python product_demo_video_analyzer_dgx.py \
+  python3 product_demo_video_analyzer_dgx.py \
     --file "$f" \
     --keyframe-mode ocr \
     --no-macro-chunking
@@ -385,7 +385,7 @@ If either check fails, re-run the `sudo apt install` line in Prerequisites befor
 ```bash
 python3.12 -m venv ~/.venvs/videoextractor
 source ~/.venvs/videoextractor/bin/activate
-python -m pip install --upgrade pip wheel setuptools
+python3 -m pip install --upgrade pip wheel setuptools
 ```
 
 **2. vLLM nightly — installs FIRST because it pulls the correct torch + CUDA libs**
@@ -401,7 +401,7 @@ Why nightly, not stable: vLLM stable falls back to Triton runtime JIT for Blackw
 Verify torch + Blackwell are visible from inside the venv:
 
 ```bash
-python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_capability(0), torch.version.cuda)"
+python3 -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_capability(0), torch.version.cuda)"
 # expect: 2.x.x True (12, 1) 13.0
 #                      ↑ sm_121  ↑ CUDA 13.0
 # If torch.version.cuda says 12.8, that's also fine — cu128 wheels run on CUDA 13 via forward-compat
@@ -438,7 +438,7 @@ huggingface-cli download Qwen/Qwen2.5-VL-32B-Instruct-AWQ
 
 ```bash
 cd /path/to/VideoExtractor
-python -c "from product_demo_video_analyzer_dgx import build_qwen_engine, build_ocr_engine, compute_dhash; print('imports ok')"
+python3 -c "from product_demo_video_analyzer_dgx import build_qwen_engine, build_ocr_engine, compute_dhash; print('imports ok')"
 ```
 
 This loads no weights. If it exits with `imports ok`, the venv is wired up correctly.
@@ -446,7 +446,7 @@ This loads no weights. If it exits with `imports ok`, the venv is wired up corre
 **7. Keyframe smoke test — validates OCR + pHash pipeline without loading vLLM**
 
 ```bash
-python product_demo_video_analyzer_dgx.py \
+python3 product_demo_video_analyzer_dgx.py \
   --file archive/<short-clip>.mp4 \
   --no-analysis --no-vision-summary --no-macro-chunking \
   --timeline --keyframe-mode ocr
@@ -457,7 +457,7 @@ Expect `[ocr-filter] Done: N keyframes saved, M OCR calls, K phash skips.` If N 
 **8. Full pipeline test with vLLM online**
 
 ```bash
-python product_demo_video_analyzer_dgx.py \
+python3 product_demo_video_analyzer_dgx.py \
   --url "https://www.youtube.com/watch?v=<short-demo-id>" \
   --keyframe-mode ocr --vision-summary --analysis --no-macro-chunking
 ```
@@ -478,7 +478,7 @@ Rebuilding from this lock file is faster than re-resolving nightly deps, but the
 |---|---|---|
 | `nvidia-smi` returns `command not found` or fails | NVIDIA driver not installed or PATH not set | On DGX/EdgeXpert this shouldn't happen; run `sudo apt install -y nvidia-utils-570` or reinstall OS drivers. Run `nvidia-smi` before anything else — if it doesn't show the Blackwell GPU and CUDA version, no Python step will work. |
 | `nvidia-smi` works but `torch.cuda.is_available()` is `False` AND `ldconfig -p \| grep libcuda.so` is empty | libcuda.so.1 isn't registered with the dynamic linker even though the driver is installed | Run `sudo ldconfig` to rebuild the linker cache. If it stays empty: `find /usr /lib -name "libcuda.so*" 2>/dev/null` — if found, add the containing directory to `/etc/ld.so.conf.d/` and re-run `ldconfig`. |
-| `torch.cuda.is_available()` is `False` after step 2 | vLLM nightly pulled torch but the CUDA driver isn't visible from Python (usually a driver-userspace mismatch or the venv shell inherited a stripped `LD_LIBRARY_PATH`) | Confirm `nvidia-smi` works. Then in the venv: `python -c "import torch; print(torch.version.cuda)"` — if this prints a version but `is_available()` is False, restart the shell / re-activate the venv. Last resort: uninstall & reinstall vLLM nightly so its pinned nvidia-* libs re-register. |
+| `torch.cuda.is_available()` is `False` after step 2 | vLLM nightly pulled torch but the CUDA driver isn't visible from Python (usually a driver-userspace mismatch or the venv shell inherited a stripped `LD_LIBRARY_PATH`) | Confirm `nvidia-smi` works. Then in the venv: `python3 -c "import torch; print(torch.version.cuda)"` — if this prints a version but `is_available()` is False, restart the shell / re-activate the venv. Last resort: uninstall & reinstall vLLM nightly so its pinned nvidia-* libs re-register. |
 | `pip's dependency resolver ... vllm X requires torch==Y, but you have torch Z is incompatible` | You installed torch manually before vLLM, and torch is now on the wrong version | Uninstall torch and let vLLM own the pin: `pip uninstall -y torch torchvision torchaudio && pip install -U --pre --extra-index-url https://wheels.vllm.ai/nightly vllm` |
 | `pip install vllm>=0.6.4` installs but model load fails with Triton JIT errors | Stable vLLM installed (not nightly); you may also have pre-installed a cu128 torch manually. Stable vLLM + CUDA 13.0 system = JIT compile path that often breaks. | Install nightly (which brings its own torch pin): `pip uninstall -y torch torchvision torchaudio vllm && pip install -U --pre --extra-index-url https://wheels.vllm.ai/nightly vllm`. Do **not** install torch separately — nightly vLLM pulls the correct torch + `nvidia-cu13` libs automatically. |
 | `get_device_capability` returns `(12, 0)` or lower | NVIDIA driver older than 570 | Update DGX OS drivers |
