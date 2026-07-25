@@ -14,4 +14,6 @@
 vllm>=0.6.4
 accelerate
 
-# Note: rapidocr-onnxruntime (OCR-gated keyframe pipeline) is in base requirements.txt.
+# Note: rapidocr (>=2.0, English PP-OCRv5 — OCR-gated keyframe pipeline) is in base
+# requirements.txt. If upgrading from the old rapidocr-onnxruntime, uninstall it first:
+#   pip uninstall -y rapidocr-onnxruntime && pip install 'rapidocr>=2.0'

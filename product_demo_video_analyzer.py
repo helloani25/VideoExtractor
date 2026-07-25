@@ -32,7 +32,7 @@ except ImportError:
     _OpenAI = None
 
 try:
-    from rapidocr_onnxruntime import RapidOCR as _RapidOCR
+    from rapidocr import RapidOCR as _RapidOCR  # rapidocr>=2.0 (PP-OCRv5)
 except ImportError:
     _RapidOCR = None
 
@@ -58,13 +58,16 @@ def build_ocr_client(backend: str):
     if backend == "rapidocr":
         if _RapidOCR is None:
             raise RuntimeError(
-                "rapidocr-onnxruntime is not installed. Run: pip install rapidocr-onnxruntime"
+                "rapidocr is not installed. Run: pip install 'rapidocr>=2.0'"
             )
-        # Local ONNX OCR on CPU (~0.4s/frame on Apple Silicon). Leaves the GPU free
-        # for the vision/analysis model and matches the DGX OCR engine. CoreML/Neural
-        # Engine is intentionally not used: benchmarked ~3.4x slower for this
-        # dynamic-shape model (per-input recompile + CoreML<->CPU tensor copies).
-        return _RapidOCR(), _RAPIDOCR_SENTINEL
+        # Local ONNX OCR on CPU (rapidocr>=2.0). Loads PP-OCRv6_rec_small.onnx, the
+        # MULTILINGUAL v6 rec model (v6 ships only as multi_*; the config's lang_type=ch
+        # is a misleading label, not a Chinese model). Reads English UI fine — the garbled
+        # Chinese-model output was the old rapidocr-onnxruntime (PP-OCRv3), now replaced;
+        # a forced English PP-OCRv5 rec tested slightly worse. For accurate OCR use
+        # --ocr-backend ollama (qwen2.5vl reads with comprehension). CoreML/Neural Engine
+        # is intentionally not used: ~3.4x slower for this dynamic-shape model.
+        return _RapidOCR(params={"Global.log_level": "error"}), _RAPIDOCR_SENTINEL
     if _OpenAI is None:
         raise RuntimeError("openai package is not installed. Run: pip install openai")
     cfg = OCR_BACKENDS[backend]
@@ -84,8 +87,9 @@ def build_ocr_client(backend: str):
 
 def extract_text_from_frame(client, model: str, frame_path: Path) -> str:
     if model == _RAPIDOCR_SENTINEL:
-        result, _elapsed = client(str(frame_path))
-        lines = [item[1] for item in result] if result else []
+        # rapidocr>=2.0 returns a result object with .txts (or None when no text found).
+        ocr_out = client(str(frame_path))
+        lines = list(ocr_out.txts) if (ocr_out is not None and getattr(ocr_out, "txts", None)) else []
         return "\n".join(lines).strip()
     with open(frame_path, "rb") as f:
         b64 = base64.b64encode(f.read()).decode()

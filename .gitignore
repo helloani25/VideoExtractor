@@ -14,3 +14,6 @@ terraform/.terraform/
 terraform/*.tfstate
 terraform/*.tfstate.backup
 /archives/
+/video_urls.txt
+/batch2_urls.txt
+/download_report_videos.py

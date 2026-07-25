@@ -133,7 +133,7 @@ Why does this preserve accuracy despite only 1 mantissa bit in FP4?
 
 **Bottom line**: NF4 (bitsandbytes) gives memory savings but no compute speed-up on Blackwell. AWQ-Marlin is the practical maximum today. NVFP4 is the ceiling but requires a pre-quantized checkpoint and vLLM FP4 backend support — not yet mainstream for Qwen2.5-VL.
 
-## OCR swap: PaddleOCR → RapidOCR
+## OCR swap: PaddleOCR → RapidOCR (multilingual PP-OCRv6)
 
 The original plan targeted PaddleOCR with TensorRT, but on aarch64 + CUDA 12.8:
 
@@ -142,6 +142,43 @@ The original plan targeted PaddleOCR with TensorRT, but on aarch64 + CUDA 12.8:
 - The `enable_mkldnn` path is CPU-only Intel-DNN — meaningless on Grace ARM anyway.
 
 **RapidOCR (ONNX Runtime)** ships clean ARM-native wheels, has a stable API across versions, and doesn't need CUDA at all. The catch — CPU by default — is compensated by the pHash prefilter below.
+
+### Package + model: use `rapidocr>=2.0`, not `rapidocr-onnxruntime`
+
+There are two RapidOCR packages, and the choice matters for English UI:
+
+- **`rapidocr-onnxruntime`** (the old 1.x package) defaults to the **Chinese `ch_PP-OCRv3` recognition model**. On English/numeric product UIs it garbles text — `Cost Codes → Coet Codes`, `$1,200 → $,200`, `Export → Eort`, `View 10 Jobsites → vew 10 2otsibes` — and occasionally emits stray Chinese glyphs (`回`) for icons. Because the RapidOCR text is threaded into the timeline column **and** the vision/analysis prompts, that garble both looks bad and pollutes the model's input.
+- **`rapidocr>=2.0`** defaults to the **multilingual PP-OCRv6** rec model (`PP-OCRv6_rec_small.onnx`), which reads English far better on the same frames — it recovers the nav bar and headers the old model dropped, with only minor slips (`Files → Fles`, `Listed → Limted`). Same CPU-only, ARM-friendly footprint. PP-OCRv6 has no language-specific variant, so the config's `lang_type: ch` is a misleading label, **not** a Chinese model. (An English-specific PP-OCRv5 rec — the newest English variant that exists — tested slightly *worse* than v6 multilingual, so it isn't forced.)
+
+`build_ocr_engine()` loads `RapidOCR(params={"Global.log_level": "error"})` from `rapidocr>=2.0`. The 2.x API returns a result object (`.txts`), not the 1.x `(list, elapsed)` tuple — see `extract_keyframes_ocr_change()`.
+
+**Accuracy expectation:** even PP-OCRv6 is a *pixel* OCR with no comprehension, so on dense tables (dollar amounts, PO numbers, cost codes) it still trails Qwen2.5-VL, which reads with understanding and gets those right. At 720p UI resolution, no RapidOCR config closes that gap.
+
+### `--qwen-ocr`: accurate OCR text from the vision model, RapidOCR as gate-only
+
+The cleaner split, added as `--qwen-ocr` (ocr mode only): **RapidOCR does only the cheap change-*gate*** — its garbled text is **never surfaced**. The on-screen text you actually see comes from the vision model:
+
+- **With `--qwen-ocr`:** after RapidOCR gates the keyframes, Qwen re-reads the **surfaced** frames (the ones the timeline and vision summary actually use — `collect_surfaced_keyframes()` mirrors `sample_keyframes()` + `assign_keyframes_to_windows()`) and that accurate text fills the timeline column and the prompts. A per-frame Qwen failure leaves that frame **blank** — never a fallback to RapidOCR garble.
+- **Without `--qwen-ocr`:** the timeline/prompts carry **no OCR text at all** (`keyframe_ocr = {}`), rather than RapidOCR's garble. RapidOCR still gates keyframes; its text is discarded.
+
+Why gate with RapidOCR at all if it's inaccurate? The gate only needs to detect that text *changed* between frames (`similarity < threshold`) — garbled-but-consistent text still changes detectably when the screen changes. So RapidOCR stays where it's cheap and adequate (1 fps across the whole video), and Qwen is spent only on the ~20–30 surfaced frames.
+
+**Cost:** `--qwen-ocr` adds ~1 vision call per surfaced keyframe (~20–30/video), bounded by `--max-vision-frames` + window count — meaningful on a large batch. The vision summary already sees the frames directly, so a run *without* `--qwen-ocr` still produces a good summary; the flag is for when you want the **timeline column and OCR-in-prompt text** to be VLM-accurate too. Result: menu items, form labels, currency, even dense Terms & Conditions paragraphs read correctly instead of `Coet Codes / Joba / 回`.
+
+### OCR & engine: `_dgx.py` vs `_analyzer.py` at a glance
+
+Both scripts run the same OCR package and reach VLM-accurate timeline OCR, but by different mechanisms — the DGX gates cheaply then upgrades the surfaced frames; the Mac picks the OCR engine per run.
+
+| Aspect | DGX (`_dgx.py`) | Mac (`_analyzer.py`) |
+|---|---|---|
+| Inference engine | vLLM (Qwen2.5-VL) | Ollama (`qwen2.5vl:32b`) |
+| Keyframing modes | `interval` / `scene` / **`ocr`** (RapidOCR-gated) | `interval` / `scene` |
+| OCR package | `rapidocr>=2.0` | `rapidocr>=2.0` |
+| RapidOCR model | multilingual PP-OCRv6 (English not forced — tested worse) | multilingual PP-OCRv6 (same) |
+| RapidOCR role | gate-only; text **discarded** | a `--ocr-backend` choice; text **surfaced** |
+| Accurate timeline OCR via Qwen | `--qwen-ocr` (gate → read surfaced frames) | `--ocr-backend ollama` (reads every keyframe) |
+
+Both default to the multilingual PP-OCRv6 rec model (`PP-OCRv6_rec_small.onnx`); the config's `lang_type: ch` is a misleading label — PP-OCRv6 has no language-specific variants, so it always loads the one multilingual model, which reads English fine.
 
 ## Keyframing: dHash prefilter + OCR-gated saves
 
@@ -418,7 +455,7 @@ If `get_device_capability` returns `(12, 0)` or lower, your NVIDIA driver is old
 **3. Everything else — pure Python and ONNX wheels, all arm64-clean**
 
 ```bash
-pip install rapidocr-onnxruntime opencv-python-headless yt-dlp openai-whisper youtube-transcript-api python-dotenv accelerate
+pip install rapidocr opencv-python-headless yt-dlp openai-whisper youtube-transcript-api python-dotenv accelerate
 ```
 
 **4. ffmpeg at OS level (Whisper needs it)**
@@ -487,6 +524,8 @@ Rebuilding from this lock file is faster than re-resolving nightly deps, but the
 | `Could not find a version that satisfies the requirement torch` (or vllm/onnxruntime) | Python 3.14 venv — many ML wheels aren't there yet on aarch64 | Use `python3.12 -m venv ...` |
 | ONNX Runtime prints `Failed to detect devices under "/sys/class/drm/card0"` | GPU probe on Grace unified memory — DRM sysfs doesn't expose the on-package Blackwell | Benign — RapidOCR runs on CPU by design. Silence with `import onnxruntime as ort; ort.set_default_logger_severity(3)` at the top of the script if noisy. |
 | vLLM OOM on model load | 32B AWQ + activations exceed the vLLM alloc | Lower `gpu_memory_utilization=0.85` in `build_qwen_engine()` (product_demo_video_analyzer_dgx.py:46), or drop to `--vision-model Qwen/Qwen2.5-VL-7B-Instruct-AWQ` |
+| `EngineCore failed to start` / `EngineCoreProc` traceback ending in a GPU/model-init error | An **orphaned `VLLM::EngineCore` from a previous run is still holding the GPU**, so the new engine can't allocate. Most common after a batch iteration was interrupted (Ctrl+C, ssh drop, crash mid-teardown). | `nvidia-smi` → look for a `VLLM::EngineCore` process holding memory. Kill it: `pkill -9 -f 'VLLM::EngineCore'`, confirm memory freed, re-run. See **GPU memory issues** below for the full flow. |
+| Per-video batch loop fails on the 2nd+ video with an EngineCore start error | vLLM V1 runs EngineCore as a **child process** that can outlive its parent; each loop iteration leaks one, and the next collides with it | Add `pkill -9 -f 'VLLM::EngineCore'; sleep 3` at the top of each loop iteration (see `run_batch2.sh`), or load the engine once via the single-invocation multi-`--url` form. |
 | `ModuleNotFoundError: No module named 'vllm'` (or `rapidocr_onnxruntime`, `cv2`, etc.) | venv not activated in this shell | `source ~/.venvs/videoextractor/bin/activate`, then re-run. To verify: `which python` should point inside `~/.venvs/videoextractor/`. |
 | `Missing dependency: yt_dlp` | venv not activated | `source ~/.venvs/videoextractor/bin/activate` |
 | `[transcript] No subtitles found` / transcript is empty and run takes much longer than expected | YouTube transcript API returned nothing (private/restricted video, Wistia URL, or local file). Pipeline falls back to Whisper, which needs `ffmpeg`. | Run `ffmpeg -version` — if not found, run `sudo apt install -y ffmpeg`. Whisper fallback is on by default; disable only with `--no-whisper-fallback`. For Wistia and local files, Whisper is always the first (and only) transcript source. |
@@ -494,6 +533,66 @@ Rebuilding from this lock file is faster than re-resolving nightly deps, but the
 | First run hangs on "Loading model" | HF download in progress silently | Pre-fetch weights (step 5). Set `HF_HUB_ENABLE_HF_TRANSFER=1` for faster downloads. |
 | vLLM prints "Initializing vLLM engine" and then nothing for 2-3 minutes | Normal — first-time CUDA kernel compilation and weight loading for a 17 GB checkpoint | Wait. Do not Ctrl+C. Look for `INFO: Model loaded` (or similar) to confirm it finished. Subsequent runs are faster once kernels are cached. |
 | `Cannot load local files without --allowed-local-media-path` during vision summary | vLLM ≥ 0.6 blocks `file://` URLs by default as a security guard | Ensure `allowed_local_media_path="/"` is in the `LLM()` constructor in `build_qwen_engine()`. If you cloned fresh, pull the latest `product_demo_video_analyzer_dgx.py` — it already includes the fix. |
+
+### GPU memory issues
+
+The GB10 shares **128 GB of unified LPDDR5X** between the Grace CPU and the Blackwell GPU, so "GPU memory" and system RAM come from the same pool. A 32B-AWQ engine holds ~19–21 GB resident. Two failure modes account for almost every GPU-memory problem here — **orphaned engines** (far more common) and **genuine OOM**.
+
+**Step 1 — always start with `nvidia-smi`.** Look at the process list at the bottom:
+
+```
+|    0   N/A  N/A     13404      G   /usr/lib/xorg/Xorg           194MiB |   ← normal (display)
+|    0   N/A  N/A     14681      G   /usr/bin/gnome-shell         172MiB |   ← normal (desktop)
+|    0   N/A  N/A     66562      C   VLLM::EngineCore           11202MiB |   ← an engine
+```
+
+- A **single** `VLLM::EngineCore` while a run is active is **normal** — that's the working engine. Do **not** kill it, or you abort the video that's processing.
+- A `VLLM::EngineCore` when **nothing should be running**, or a run failing to start while one is listed, means it's an **orphan** blocking new engines.
+
+**Step 2 — orphaned engine (the usual culprit).** vLLM V1 launches EngineCore as a **child process**; if a run is interrupted (Ctrl+C, ssh drop, exception mid-teardown) the child can outlive its parent and keep the GPU allocated. Symptom: `EngineCore failed to start` on the next launch.
+
+**Full teardown — copy-paste when the GPU is stuck.** The `<pid>` is tied to the `VLLM::EngineCore` line in `nvidia-smi` — the query below pulls it automatically (`--query-compute-apps` lists only *compute* processes, i.e. the engine, not Xorg/gnome-shell which are graphics):
+
+```bash
+nvidia-smi                                     # 1. see the VLLM::EngineCore holding memory
+
+# 2. capture that engine's PID straight from nvidia-smi (compute apps = the vLLM engine)
+PID=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader | head -1 | tr -d ' ')
+echo "vLLM EngineCore PID: ${PID:-<none — GPU already clear>}"
+
+ps -o pid,ppid,stat,cmd -p "$PID"              # 3. inspect it: parent (PPID) + state flag
+ps aux | grep -E 'product_demo_video_analyzer|nohup.*vllm' | grep -v grep   #    is the batch still alive?
+cat /proc/$PID/status | grep State             # 4. R/S = killable, D = wedged (see Step 3)
+
+# 5. kill — parent FIRST (or it respawns/hangs the child), then the engine, then sweep
+pkill -9 -f product_demo_video_analyzer_dgx    #    the batch loop / script (parent)
+pkill -9 -f 'VLLM::EngineCore'                 #    the engine child (matches the nvidia-smi name)
+pkill -9 -f vllm                               #    catch any remaining vllm workers
+kill -9 "$PID" 2>/dev/null                     #    and the exact PID from nvidia-smi, to be sure
+
+sleep 3; nvidia-smi                            # 6. confirm: only Xorg + gnome-shell (~366 MiB)
+```
+
+Do not relaunch until `nvidia-smi` is clean, or the new engine collides with the old one again. To prevent recurrence in a batch loop, clear orphans before each iteration (`pkill -9 -f 'VLLM::EngineCore'; sleep 3` — as `run_batch2.sh` does), or load the engine once with the single-invocation multi-`--url` form.
+
+**Step 3 — engine won't die (`kill` has no effect, same PID persists).** Check the state of the `$PID` captured in Step 2:
+
+```bash
+cat /proc/$PID/status | grep State
+```
+
+- `State: R` or `S` **and a live parent** → it's being held/respawned by the parent; kill the parent (the `pkill -f product_demo_video_analyzer_dgx` above).
+- `State: D` (**uninterruptible sleep**) → it's wedged inside a GPU/driver syscall; `kill -9` is queued but can't reap it. This is a hung GPU context, not a "kill harder" problem. Try `sudo nvidia-smi --gpu-reset -i 0`; if that reports the device is in use, **reboot** — that reliably clears a wedged GB10 context.
+
+**Step 4 — genuine OOM (only after confirming no orphan).** If `nvidia-smi` is clean and the engine still OOMs during model load or KV-cache allocation:
+
+- Lower the reservation: set `gpu_memory_utilization=0.85` (or `0.80`) in `build_qwen_engine()` (`product_demo_video_analyzer_dgx.py:46`).
+- Shrink the context: reduce `max_model_len` in the same constructor.
+- Drop model size: `--vision-model Qwen/Qwen2.5-VL-7B-Instruct-AWQ` (~5 GB).
+- Reduce vision payload: lower `--max-vision-frames`, and for macro-chunking lower `--macro-frames-per-window` / `--capture-fps`.
+- Remember the pool is **shared** — a large concurrent Whisper model or many CPU-side buffers eat into the same 128 GB. The pipeline runs Whisper→vision sequentially, so this mainly bites if you run multiple batches at once (don't — see below).
+
+**Never run two vLLM batches at the same time.** They contend for the GPU, and any `pkill -f 'VLLM::EngineCore'` guard in one batch will kill the *other* batch's engine. Let one finish (`tail` its log, or watch the `_*.md` count) before starting the next.
 
 ---
 
@@ -507,31 +606,31 @@ Useful when a demo shows UI elements, labels, menus, data values, or any on-scre
 
 ```bash
 # Both audio transcript + frame OCR (default, one frame every 5s)
-python video_extractor.py --url "https://www.youtube.com/watch?v=VIDEO_ID"
+python3 video_extractor.py --url "https://www.youtube.com/watch?v=VIDEO_ID"
 
 # Wistia video
-python video_extractor.py --url "https://fast.wistia.com/embed/iframe/VIDEO_ID"
+python3 video_extractor.py --url "https://fast.wistia.com/embed/iframe/VIDEO_ID"
 
 # Wistia via page embed URL
-python video_extractor.py --url "https://example.com/page?wvideo=VIDEO_ID"
+python3 video_extractor.py --url "https://example.com/page?wvideo=VIDEO_ID"
 
 # Scene-change sampling — only capture when screen content changes
-python video_extractor.py --url "URL" --scene-threshold 25
+python3 video_extractor.py --url "URL" --scene-threshold 25
 
 # Coarser interval (one frame every 10s)
-python video_extractor.py --url "URL" --frame-interval 10
+python3 video_extractor.py --url "URL" --frame-interval 10
 
 # OpenAI GPT-4o vision instead of Ollama
-python video_extractor.py --url "URL" --backend openai
+python3 video_extractor.py --url "URL" --backend openai
 
 # Audio transcription only (skip vision OCR)
-python video_extractor.py --url "URL" --no-frames
+python3 video_extractor.py --url "URL" --no-frames
 
 # Frame OCR only (skip audio)
-python video_extractor.py --url "URL" --no-whisper
+python3 video_extractor.py --url "URL" --no-whisper
 
 # Larger Whisper model for better accuracy
-python video_extractor.py --url "URL" --whisper-model small
+python3 video_extractor.py --url "URL" --whisper-model small
 ```
 
 ### CLI Options
@@ -624,7 +723,7 @@ This installs the base pipeline (yt-dlp, OpenCV, Whisper, transcript API, RapidO
 
 | Model | Notes |
 |---|---|
-| `llava` / `llava:13b` / `llava:34b` | LLaVA family; lighter than llama3.2-vision at the 7B size |
+| `llava` / `llava:13b` / `llava:34b` | LLaVA family; smaller/faster than `qwen2.5vl:32b`, lower accuracy on dense UI |
 | `minicpm-v` | Compact multimodal model, good for OCR-heavy tasks |
 | `moondream` | Very small, fast; lower accuracy on complex scenes |
 | `bakllava` | LLaVA variant fine-tuned on Mistral |
@@ -1150,6 +1249,7 @@ Authoritative for the DGX pipeline. All options match `parse_args()` in `product
 | `--ocr-similarity-threshold F` | `0.85` | For `ocr` mode: text similarity threshold — save a frame when OCR text similarity vs the last saved frame falls **below** this value. Higher = fewer keyframes. |
 | `--phash-threshold N` | `5` | For `ocr` mode: Hamming distance (out of 64 bits) below which the dHash prefilter skips OCR entirely. Higher = more skips (fewer OCR calls, coarser keyframes). |
 | `--min-keyframe-gap F` | `1.0` | Minimum seconds between saved frames. |
+| `--qwen-ocr` | off | ocr mode only. Re-read the surfaced keyframes (timeline + summary frames) with the vision model for accurate OCR text; RapidOCR stays gate-only and its garble is never surfaced. Without it, timeline/prompts carry no OCR text. Adds ~1 vision call per surfaced keyframe. |
 | `--macro-window-seconds N` | `15` | For macro-chunking: window size in seconds. |
 | `--capture-fps N` | `6` | For macro-chunking: frame sampling rate (fps). |
 | `--macro-frames-per-window N` | `8` | For macro-chunking: max frames per window sent to the vision model. |

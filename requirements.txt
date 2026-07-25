@@ -15,7 +15,9 @@ torchaudio
 
 # OCR — RapidOCR via ONNX Runtime (CPU, ARM-friendly). Used by the keyframe OCR
 # path on both platforms: DGX's ocr keyframe mode and Mac's --ocr-backend rapidocr.
-rapidocr-onnxruntime
+# rapidocr>=2.0 ships the English PP-OCRv5 model (the old rapidocr-onnxruntime
+# defaulted to a Chinese model that garbled English UI text).
+rapidocr>=2.0
 
 # Transcript APIs
 youtube-transcript-api

@@ -33,7 +33,7 @@ except ImportError:
     SamplingParams = None
 
 try:
-    from rapidocr_onnxruntime import RapidOCR
+    from rapidocr import RapidOCR  # rapidocr>=2.0 (PP-OCRv5); NOT the older rapidocr-onnxruntime
 except ImportError:
     RapidOCR = None
 
@@ -89,10 +89,21 @@ def call_qwen(
 
 
 def build_ocr_engine():
-    """Load RapidOCR (ONNX Runtime, CPU by default). ARM-friendly, wheel-only setup."""
+    """Load RapidOCR (rapidocr>=2.0, ONNX Runtime, CPU), default PP-OCRv6 rec model.
+
+    The loaded model is PP-OCRv6_rec_small.onnx — the *multilingual* v6 model. PP-OCRv6
+    recognition ships only as `multi_*` (no Chinese- or English-specific v6 exists), so
+    the config's `lang_type: ch` is a misleading default label, not a Chinese model: for
+    v6 every lang selection resolves to the same multilingual model, which reads English
+    UI text fine. (The garbled `回`/`Coet Codes` output was the OLD rapidocr-onnxruntime /
+    PP-OCRv3 package, now replaced. The English-specific PP-OCRv5 rec — the newest English
+    variant that exists — tested slightly *worse* than v6 multilingual, so it isn't forced.)
+    In ocr mode this only gates keyframes on text change; with --qwen-ocr its text is
+    discarded and the vision model supplies accurate OCR, so accuracy here isn't critical.
+    """
     if RapidOCR is None:
-        raise RuntimeError("rapidocr-onnxruntime not installed. Run: pip install rapidocr-onnxruntime")
-    return RapidOCR()
+        raise RuntimeError("rapidocr not installed. Run: pip install 'rapidocr>=2.0'")
+    return RapidOCR(params={"Global.log_level": "error"})
 
 
 def compute_dhash(frame_bgr, hash_size: int = 8) -> np.ndarray:
@@ -758,9 +769,11 @@ def extract_keyframes_ocr_change(
                 frame_idx += 1
                 continue
 
-            ocr_result, _elapsed = ocr_engine(frame)
+            ocr_out = ocr_engine(frame)
             ocr_calls += 1
-            current_text_lines = [item[1] for item in ocr_result] if ocr_result else []
+            # rapidocr>=2.0 returns a result object with .txts (tuple of strings), or
+            # .txts is None when no text is found.
+            current_text_lines = list(ocr_out.txts) if (ocr_out is not None and getattr(ocr_out, "txts", None)) else []
             current_text = "\n".join(current_text_lines).strip()
 
             if not last_text:
@@ -1000,6 +1013,82 @@ Respond in markdown with:
 - **UX notes**
 """
     return call_qwen(engine, prompt, [])
+
+
+def ocr_keyframes_with_qwen(engine, keyframe_paths: list[Path]) -> dict[str, str]:
+    """Read each given keyframe with the vision model for accurate on-screen text.
+
+    RapidOCR gates the keyframes cheaply but garbles dense/small English UI text
+    (Cost Codes -> Coet Codes, $1,200 -> $,200), so its text is never surfaced. The
+    vision model reads with comprehension (dollar amounts, cost codes, job names). A
+    frame whose Qwen call fails is left blank rather than falling back to RapidOCR —
+    we never surface garbled text.
+    """
+    prompt = (
+        "Extract ALL visible text from this UI screenshot exactly as it appears — "
+        "menu items, headers, table cells, labels, numbers, and currency values. "
+        "Output only the extracted text, one item per line, with no commentary."
+    )
+    result: dict[str, str] = {}
+    failures = 0
+    for path in keyframe_paths:
+        try:
+            result[path.name] = call_qwen(engine, prompt, [path], max_tokens=2048).strip()
+        except Exception as exc:
+            result[path.name] = ""  # blank, never RapidOCR garble
+            failures += 1
+            print(f"[qwen-ocr] {path.name} failed ({exc}); left blank.")
+    print(
+        f"[qwen-ocr] Read {len(keyframe_paths)} keyframes with the vision model"
+        f"{f' ({failures} failed, left blank)' if failures else ''}."
+    )
+    return result
+
+
+def collect_surfaced_keyframes(
+    keyframes: list[Path],
+    segments: list[dict[str, Any]],
+    run_vision_summary: bool,
+    generate_timeline: bool,
+    max_vision_frames: int,
+    timeline_window_seconds: int,
+    duration: Optional[float],
+) -> list[Path]:
+    """Union of keyframes actually shown/used: the vision-summary selection plus the
+    one-per-window frame the timeline picks. Frames the gate saved but nothing surfaces
+    are excluded, so Qwen-OCR only spends calls on frames a human/model will actually see.
+    Mirrors sample_keyframes() and assign_keyframes_to_windows()'s selection exactly.
+    """
+    seen: set[str] = set()
+    out: list[Path] = []
+
+    def add(p: Path) -> None:
+        if p.name not in seen:
+            seen.add(p.name)
+            out.append(p)
+
+    if run_vision_summary:
+        for p in sample_keyframes(keyframes, max_vision_frames):
+            add(p)
+
+    if generate_timeline:
+        for window in build_time_windows(segments, timeline_window_seconds, duration):
+            midpoint = (window["start"] + window["end"]) / 2.0
+            best: Optional[Path] = None
+            best_dist = float("inf")
+            for kf in keyframes:
+                try:
+                    ts = float(kf.stem.split("_")[-1].rstrip("s"))
+                except (ValueError, IndexError):
+                    continue
+                dist = abs(ts - midpoint)
+                if dist < best_dist:
+                    best_dist = dist
+                    best = kf
+            if best is not None:
+                add(best)
+
+    return out
 
 
 def analyze_with_qwen_vision(
@@ -1531,6 +1620,7 @@ def run(
     ocr_similarity_threshold: float = 0.85,
     phash_threshold: int = 5,
     quantization: str | None = None,
+    use_qwen_ocr: bool = False,
 ) -> None:
     reports_dir = work_dir / "reports"
     frames_root = work_dir / "frames"
@@ -1538,7 +1628,7 @@ def run(
     frames_root.mkdir(parents=True, exist_ok=True)
 
     qwen_engine = None
-    if run_analysis or run_vision_summary or run_macro_chunking:
+    if run_analysis or run_vision_summary or run_macro_chunking or use_qwen_ocr:
         qwen_engine = build_qwen_engine(vision_model, quantization=quantization)
 
     ocr_engine = None
@@ -1690,6 +1780,26 @@ def run(
                     frame_width=frame_width,
                 )
             print(f"[{video_id}] {len(keyframes)} keyframes saved to {keyframes_dir}")
+
+            # In ocr mode RapidOCR only did the cheap change-gate above — its text is
+            # garbled on dense/small English UI, so it is never surfaced. With --qwen-ocr,
+            # re-read the SURFACED keyframes (those the timeline/summary actually use) with
+            # the vision model for accurate text. Without the flag, drop the OCR text
+            # entirely so no RapidOCR garble reaches the timeline column or prompts.
+            if keyframe_mode == "ocr":
+                if use_qwen_ocr and qwen_engine is not None and keyframes:
+                    duration = get_video_duration_seconds(video_path) if video_path else None
+                    surfaced = collect_surfaced_keyframes(
+                        keyframes, segments, run_vision_summary, generate_timeline,
+                        max_vision_frames, timeline_window_seconds, duration,
+                    )
+                    print(
+                        f"[{video_id}] Qwen-OCR: reading {len(surfaced)} surfaced keyframes "
+                        f"(of {len(keyframes)} saved)..."
+                    )
+                    keyframe_ocr = ocr_keyframes_with_qwen(qwen_engine, surfaced)
+                else:
+                    keyframe_ocr = {}
 
         if generate_timeline:
             duration = get_video_duration_seconds(video_path) if video_path else None
@@ -2020,6 +2130,17 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Minimum seconds between saved frames (default: 1.0).",
     )
+    parser.add_argument(
+        "--qwen-ocr",
+        action="store_true",
+        help=(
+            "In ocr keyframe mode, re-read the SURFACED keyframes (the ones the timeline "
+            "and vision summary actually use) with the vision model for accurate on-screen "
+            "text. RapidOCR still does the cheap change-gate; its garbled text is never "
+            "surfaced. Without this flag, the timeline/prompts carry NO OCR text rather "
+            "than RapidOCR's garble. Adds ~1 vision call per surfaced keyframe."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -2055,4 +2176,5 @@ if __name__ == "__main__":
         ocr_similarity_threshold=args.ocr_similarity_threshold,
         phash_threshold=args.phash_threshold,
         quantization=(None if args.quantization in (None, "none") else args.quantization),
+        use_qwen_ocr=args.qwen_ocr,
     )
